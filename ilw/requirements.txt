@@ -2,7 +2,6 @@ requests
 pandas
 snowflake-connector-python
 
-
 def snowflake_connection_from_env():
     """Build a Snowflake connection from SNOWFLAKE_* env vars.
 
