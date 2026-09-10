@@ -1,71 +1,999 @@
 requests
 pandas
 snowflake-connector-python
-def _bindable(value: Any) -> Any:
-    """Convert a value coming out of pandas into something the Snowflake
-    connector's parameter binder actually recognizes.
+"""Command-line POC for real API testing and offline integration demos."""
 
-    The connector picks a binder by the value's exact class name
-    (`type(value).__name__`), not by isinstance/subclass checks - so a
-    `pandas.Timestamp`, despite being a real `datetime.datetime` subclass,
-    is rejected with "Binding data in type (timestamp) is not supported"
-    unless it's converted to a plain `datetime.datetime` first. Every
-    EFFECTIVE_FROM/EFFECTIVE_TO/DETECTED_AT value here either comes straight
-    from `pd.Timestamp.now()` (incremental_load_core) or has passed through
-    a pandas DataFrame in fetch_current_rows(), so both insert and close
-    parameters need this, not just one or the other.
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+
+from status_history_core import (
+    CONTROL_EXPECTATIONS,
+    CONTROL_PROJECT_ID,
+    HIERARCHY_LEVEL_NAMES,
+    attach_to_project_rows,
+    build_task_hierarchy_table,
+    build_task_inventory,
+    classify_task_history_availability,
+    lifecycle_metrics,
+    normalize_bi_export,
+    normalize_events,
+    reconcile_task_inventory,
+    trace_project_status_history,
+    verify_control_project,
+)
+
+
+def status_workflow_map(client) -> dict[str, dict]:
+    """customStatusId -> {"workflow_id", "workflow_name"}, built from GET /workflows.
+
+    Reuses flatten_workflows() (already used by map-statuses) instead of a
+    second parallel implementation - one live call, one source of truth for
+    which workflow a status belongs to.
     """
-    if isinstance(value, pd.Timestamp):
-        return None if pd.isna(value) else value.to_pydatetime()
-    if value is pd.NaT:
-        return None
+    from wrike_status_api import flatten_workflows
+
+    catalog = flatten_workflows(client.workflows_payload())
+    return {
+        row["custom_status_id"]: {"workflow_id": row["workflow_id"], "workflow_name": row["workflow_name"]}
+        for row in catalog
+    }
+
+
+def parse_expected(pairs: list[str] | None) -> list[dict[str, str]]:
+    """Parse repeated --expected "Status Name:YYYY-MM-DD" values.
+
+    Kept separate from argparse wiring so it's testable on its own - a typo
+    here (missing colon, bad date) should fail loudly, not silently produce
+    an expectation nobody meant to check.
+    """
+    parsed: list[dict[str, str]] = []
+    for pair in pairs or []:
+        if ":" not in pair:
+            raise SystemExit(
+                f"--expected value {pair!r} must be 'Status Name:YYYY-MM-DD' (missing ':')"
+            )
+        status_name, _, date_part = pair.partition(":")
+        status_name = status_name.strip()
+        date_part = date_part.strip()
+        if not status_name or not date_part:
+            raise SystemExit(f"--expected value {pair!r} must be 'Status Name:YYYY-MM-DD'")
+        try:
+            pd.Timestamp(date_part)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"--expected value {pair!r} has an invalid date: {exc}")
+        parsed.append({"status_name": status_name, "status_changed_date": date_part})
+    return parsed
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def callback_url() -> str:
+    value = os.getenv("WRIKE_WEBHOOK_URL", "").strip()
+    return value or getpass.getpass("Approved callback URL (hidden; not saved): ").strip()
+
+
+def webhook_secret() -> str:
+    value = os.getenv("WRIKE_WEBHOOK_SECRET", "").strip()
+    return value or getpass.getpass("Webhook signing secret (hidden; not saved): ").strip()
+
+
+def redact_webhook_response(value):
+    """Remove callback URLs and secrets before writing registration evidence."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if key.lower() in {"hookurl", "secret"}
+            else redact_webhook_response(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_webhook_response(item) for item in value]
     return value
 
 
-def apply_changes(connection, changes: dict[str, Any]) -> dict[str, int]:
-    """Apply rows_to_close (UPDATE) then rows_to_insert (INSERT) inside one
-    transaction, so a run either fully lands or fully rolls back - a partial
-    apply (rows closed but the replacement never inserted) would silently
-    lose the "current status" for that project.
+def dated_output_dir(base: str) -> Path:
+    """Namespace a diagnostic output directory by UTC date (base/YYYYMMDD/).
+
+    A rerun on a later day writes to a new folder instead of silently
+    overwriting the previous day's evidence. These are point-in-time
+    snapshots and cannot be recreated once lost — see the deleted UAT
+    tracker copies incident (2026-08-27), which is exactly this failure
+    mode and is why this exists.
     """
-    closed = 0
-    inserted = 0
-    with connection.cursor() as cursor:
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d")
+    path = Path(base) / stamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_outputs(history: pd.DataFrame, output: Path, diagnostics: dict | None = None) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    history.to_csv(output / "project_status_history.csv", index=False)
+    lifecycle_metrics(history).to_csv(output / "project_status_lifecycle.csv", index=False)
+    if diagnostics is not None:
+        (output / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2, default=str))
+    print(f"Wrote {len(history)} history rows to {output}")
+
+
+def control_history_probe_specs(project_id: str):
+    """Historical probes scoped to Akash's May/June 2026 control window."""
+    window = json.dumps(
+        {"start": "2026-05-01T00:00:00Z", "end": "2026-07-01T00:00:00Z"},
+        separators=(",", ":"),
+    )
+    return [
+        (
+            "audit_log",
+            {
+                "eventDate": window,
+                "operations": json.dumps(["TaskStatusChanged"], separators=(",", ":")),
+                "objectType": "Project",
+                "objectIds": json.dumps([project_id], separators=(",", ":")),
+            },
+            "HISTORICAL PATH A - Audit Log (needs amReadOnlyAuditLog)",
+        ),
+        ("data_export", None, "HISTORICAL PATH B - BI Export (needs dataExportFull)"),
+    ]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    audit = sub.add_parser("audit-backfill")
+    audit.add_argument("--project-id", action="append", required=True)
+    audit.add_argument("--start", default="2024-01-01T00:00:00Z")
+    audit.add_argument("--end")
+    audit.add_argument("--output", default="wrike_status_output")
+    trace = sub.add_parser(
+        "trace-status-history",
+        help=(
+            "Fetch a project's CURRENT status live from Wrike, then trace backward "
+            "through every prior status change (via Audit Log) to the very first "
+            "stage. Every value comes from Wrike - nothing is entered manually. "
+            "If the historical trail can't be reached, prints exactly which "
+            "endpoint/scope blocked it plus the Wrike developer docs link for it, "
+            "instead of substituting anything locally-authored."
+        ),
+    )
+    trace.add_argument("--project-id", required=True)
+    trace.add_argument("--output", default="status_trace")
+    task_inventory = sub.add_parser(
+        "extract-task-inventory",
+        help=(
+            "Pull EVERY task and subtask under a project, at any nesting depth - "
+            "task, subtask, sub-subtask, and so on - via GET /folders/{id}/tasks "
+            "(descendants+subTasks=true) followed by a closure walk over "
+            "subTaskIds so no depth is missed. Every field comes from Wrike; "
+            "nothing is inferred or typed in."
+        ),
+    )
+    task_inventory.add_argument("--project-id", default="MQAAAAEGPpOb")
+    task_inventory.add_argument(
+        "--expected-csv",
+        help=(
+            "Optional Excel/Snowflake export of expected tasks (must have a "
+            "task_id column, and an item_type column of TASK/SUBTASK if you "
+            "want expected task/subtask sub-counts). When given, writes a "
+            "reconciliation report against the pulled inventory."
+        ),
+    )
+    task_inventory.add_argument("--output", default="task_inventory")
+    hierarchy = sub.add_parser(
+        "extract-project-hierarchy",
+        help=(
+            "Look up a project by NAME (not ID) and pull its full task/subtask "
+            "hierarchy, at whatever depth that project actually uses - the "
+            "output has parent_task/child_task/grandchild_task/... column "
+            "pairs, but ONLY as many pairs as the deepest chain in this "
+            "project needs (a 3-level project gets 3 pairs, not 6). If the "
+            "name matches more than one project, every match is pulled."
+        ),
+    )
+    hierarchy.add_argument("--project-name", required=True)
+    hierarchy.add_argument("--output", default="project_hierarchy")
+    classify_history = sub.add_parser(
+        "classify-task-history",
+        help=(
+            "Per Akash's assignment step 6: for every task/subtask under a "
+            "project, classify what the accessible Wrike sources can prove "
+            "about its status history (CURRENT_STATUS_ONLY / HISTORY_AVAILABLE / "
+            "INSUFFICIENT_EVIDENCE / TASK_NOT_FOUND). Actually inspects each "
+            "task's fields and attempts Audit Log live rather than assuming "
+            "the answer from the project-level finding."
+        ),
+    )
+    classify_history.add_argument("--project-id", default="MQAAAAEGPpOb")
+    classify_history.add_argument(
+        "--expected-csv",
+        help=(
+            "Optional expected task_id list (Excel/Snowflake export). Any "
+            "expected ID not returned by the API is classified TASK_NOT_FOUND "
+            "instead of silently being left out."
+        ),
+    )
+    classify_history.add_argument("--output", default="task_history_classification")
+    bi = sub.add_parser("bi-normalize")
+    bi.add_argument("--bi-dir", required=True)
+    bi.add_argument("--output", default="wrike_status_output")
+    webhook = sub.add_parser("webhook-normalize")
+    webhook.add_argument("--input", required=True)
+    webhook.add_argument("--output", default="wrike_status_output")
+    webhook.add_argument(
+        "--source",
+        required=True,
+        help=(
+            "Value written to the `source` column. No default on purpose — "
+            "forces an explicit choice instead of letting fabricated demo "
+            "events silently default to WEBHOOK. Use WEBHOOK for a real "
+            "captured event, SYNTHETIC_DEMO for fabricated sample events "
+            "(source is part of the primary key, so they can never collide "
+            "with or be mistaken for real Wrike history)."
+        ),
+    )
+    enrich = sub.add_parser("enrich-csv")
+    enrich.add_argument("--wrike-stg", required=True)
+    enrich.add_argument("--history", required=True)
+    enrich.add_argument("--output", default="Wrike_STG_STATUS_HISTORY_POC.csv")
+    inspect_webhooks = sub.add_parser(
+        "inspect-webhooks",
+        help="Fetch GET /webhooks and prove it returns subscription metadata, not historical status events",
+    )
+    inspect_webhooks.add_argument("--output", default="webhook_inspection")
+    register_webhook = sub.add_parser(
+        "register-webhook",
+        help=(
+            "Register a project-scoped webhook for future events. Existing "
+            "history is never replayed."
+        ),
+    )
+    register_webhook.add_argument("--folder-id", required=True)
+    register_webhook.add_argument(
+        "--event",
+        action="append",
+        dest="events",
+        help="Webhook event; repeat for multiple events (default: ProjectStatusChanged)",
+    )
+    register_webhook.add_argument(
+        "--field",
+        action="append",
+        dest="fields",
+        help=(
+            "Additional payload field; repeat as needed "
+            "(default: title, customFields, project)"
+        ),
+    )
+    register_webhook.add_argument("--recursive", action="store_true")
+    register_webhook.add_argument(
+        "--secure",
+        action="store_true",
+        help="Use WRIKE_WEBHOOK_SECRET or prompt for a signing secret",
+    )
+    register_webhook.add_argument(
+        "--force",
+        action="store_true",
+        help="Create another registration even if the same URL/folder already exists",
+    )
+    register_webhook.add_argument("--output", default="webhook_registration")
+    map_statuses = sub.add_parser(
+        "map-statuses",
+        help="Build the customStatusId -> readable status name catalog from GET /workflows",
+    )
+    map_statuses.add_argument("--output", default="status_catalog")
+    diagnose = sub.add_parser(
+        "diagnose-access",
+        help="Probe each endpoint and record which are accessible with the current token",
+    )
+    diagnose.add_argument("--project-id", default="MQAAAAEGPpOb")
+    diagnose.add_argument("--output", default="access_diagnostics")
+    inspect_project = sub.add_parser(
+        "inspect-project",
+        help="Fetch a project and label every date/status field with what it actually means (actual event vs planned schedule value)",
+    )
+    inspect_project.add_argument("--project-id", default="MQAAAAEGPpOb")
+    inspect_project.add_argument("--output", default="project_inspection")
+    verify_control = sub.add_parser(
+        "verify-control",
+        help=(
+            "Compare a project against expected status transitions. Defaults to "
+            "Akash's In Progress (May 26) / Completed (June 10) facts ONLY for "
+            "the [FR] Mac APR Update control project - any other --project-id "
+            "requires --expected, since those dates don't apply elsewhere."
+        ),
+    )
+    verify_control.add_argument("--project-id", default="MQAAAAEGPpOb")
+    verify_control.add_argument(
+        "--expected",
+        action="append",
+        dest="expected",
+        metavar="STATUS:YYYY-MM-DD",
+        help=(
+            "Expected status/date pair to check, e.g. 'In Progress:2026-05-26'. "
+            "Repeat for multiple. Required for any project other than the "
+            "control project - CONTROL_EXPECTATIONS never applies elsewhere."
+        ),
+    )
+    verify_control.add_argument(
+        "--history",
+        help=(
+            "Optional canonical project_status_history.csv from Audit Log or BI Export. "
+            "Synthetic rows are rejected."
+        ),
+    )
+    verify_control.add_argument("--output", default="control_project_verification")
+    args = parser.parse_args()
+
+    if args.command == "audit-backfill":
+        from wrike_status_api import WrikeClient, WrikePermissionError
+
+        client = WrikeClient(token())
+        names = {}
+        for project_id in args.project_id:
+            project = client.project(project_id)
+            names[project_id] = project.get("title")
+        statuses = client.status_names()
         try:
-            for close in changes["rows_to_close"]:
-                cursor.execute(
-                    f"""
-                    UPDATE {FQN}
-                    SET EFFECTIVE_TO = %(effective_to)s, IS_CURRENT = FALSE
-                    WHERE PROJECT_ID = %(project_id)s
-                      AND EFFECTIVE_FROM = %(effective_from)s
-                      AND IS_CURRENT = TRUE
-                    """,
+            events = client.audit_log(object_ids=args.project_id, start=args.start, end=args.end)
+        except WrikePermissionError as exc:
+            raise SystemExit(
+                f"Historical Audit Log access is blocked: {exc}\n"
+                "Required: Enterprise admin, Create user activity reports, and amReadOnlyAuditLog scope."
+            )
+        history = normalize_events(events, source="AUDIT_LOG", project_names=names, status_names=statuses)
+        write_outputs(history, Path(args.output), {"source": "AUDIT_LOG", "projects": args.project_id})
+    elif args.command == "trace-status-history":
+        from wrike_status_api import WrikeClient, WrikePermissionError
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        status_names = client.status_names()
+
+        blocked_reason = None
+        try:
+            raw_events = client.audit_log(object_ids=[args.project_id], start="2000-01-01T00:00:00Z")
+        except WrikePermissionError as exc:
+            raw_events = None
+            blocked_reason = str(exc)
+
+        result = trace_project_status_history(
+            project,
+            status_names=status_names,
+            raw_audit_events=raw_events,
+            blocked_reason=blocked_reason,
+        )
+
+        output = dated_output_dir(args.output)
+        result["stages"].to_csv(output / "status_history_from_beginning.csv", index=False)
+        (output / "trace_report.json").write_text(
+            json.dumps({k: v for k, v in result.items() if k != "stages"}, indent=2, default=str)
+        )
+
+        print(f"Project: {result['project_name']} ({result['project_id']})")
+        print(f"Current status (live from Wrike): {result['current_status_name']}")
+
+        known_facts = result.get("known_facts") or []
+        print(f"\nStatus/date facts extractable right now, without Audit Log ({len(known_facts)}):")
+        if not known_facts:
+            print("  (none - this project has no completedDate set)")
+        else:
+            for fact in known_facts:
+                print(f"  {fact['status_name']} on {fact['changed_at']}  [source: {fact['source']}]")
+
+        if result["blocked"]:
+            print("\nBLOCKED - could not retrieve the full historical trail:")
+            print(f"  {result['blocked_reason']}")
+            print(
+                "\nEverything above is live from Wrike. No other stages/dates are "
+                "shown because none could be retrieved - nothing here is invented "
+                "or manually entered."
+            )
+        else:
+            stages = result["stages"]
+            print(f"\nFull status trail, from the beginning to current ({len(stages)} transition(s)):")
+            if stages.empty:
+                print("  (no status-change events found in Audit Log for this project)")
+            else:
+                for _, row in stages.iterrows():
+                    origin = row.get("old_status_name") or "(project created)"
+                    print(f"  {row['status_changed_at']}  {origin} -> {row['status_name']}")
+            if not result["traces_back_to_current"]:
+                print(
+                    "\nWARNING: the last historical entry does not match the live "
+                    "current status - Audit Log data may be incomplete for this window."
+                )
+        print(f"\nWrote {output}/")
+    elif args.command == "extract-task-inventory":
+        from wrike_status_api import WrikeClient, WrikePermissionError
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        status_names = client.status_names()
+        workflows = status_workflow_map(client)
+
+        try:
+            contacts = {
+                str(c["id"]): f"{c.get('firstName', '')} {c.get('lastName', '')}".strip()
+                for c in client.contacts()
+                if c.get("id")
+            }
+        except WrikePermissionError as exc:
+            print(f"WARNING: could not resolve contact names ({exc}); assignee/creator names will be blank.")
+            contacts = {}
+
+        direct_tasks = client.tasks_in_folder(args.project_id)
+        tasks_by_id: dict[str, dict] = {str(t["id"]): t for t in direct_tasks if t.get("id")}
+
+        # Closure walk: tasks_in_folder() is not guaranteed to reach every
+        # depth of task -> subtask -> sub-subtask on its own - keep resolving
+        # any subTaskIds it referenced but didn't return until nothing new
+        # turns up, so "every task and subtask, however deeply nested" is an
+        # actual guarantee, not an assumption about how deep subTasks=true recurses.
+        rounds = 0
+        while True:
+            missing = sorted(
+                {
+                    str(sub_id)
+                    for task in tasks_by_id.values()
+                    for sub_id in (task.get("subTaskIds") or [])
+                    if str(sub_id) not in tasks_by_id
+                }
+            )
+            if not missing:
+                break
+            rounds += 1
+            for fetched in client.tasks_batch(missing):
+                if fetched.get("id"):
+                    tasks_by_id[str(fetched["id"])] = fetched
+
+        inventory = build_task_inventory(
+            project_id=args.project_id,
+            project_name=project.get("title"),
+            tasks_by_id=tasks_by_id,
+            status_names=status_names,
+            contact_names=contacts,
+            status_workflows=workflows,
+        )
+
+        output = dated_output_dir(args.output)
+        inventory.to_csv(output / "task_inventory.csv", index=False)
+
+        summary = {
+            "project_id": args.project_id,
+            "project_name": project.get("title"),
+            "direct_tasks_returned": len(direct_tasks),
+            "closure_walk_rounds": rounds,
+            "additional_tasks_from_closure_walk": len(tasks_by_id) - len(direct_tasks),
+            "total_tasks_and_subtasks": len(tasks_by_id),
+            "task_count": int((inventory["item_type"] == "TASK").sum()) if not inventory.empty else 0,
+            "subtask_count": int((inventory["item_type"] == "SUBTASK").sum()) if not inventory.empty else 0,
+        }
+
+        print(f"Project: {summary['project_name']} ({summary['project_id']})")
+        print(f"Direct GET /folders/{{id}}/tasks (descendants+subTasks=true) returned: {summary['direct_tasks_returned']}")
+        print(f"Closure walk over subTaskIds: {summary['closure_walk_rounds']} round(s), "
+              f"+{summary['additional_tasks_from_closure_walk']} additional task(s) found")
+        print(f"Total tasks + subtasks (all depths): {summary['total_tasks_and_subtasks']} "
+              f"({summary['task_count']} top-level tasks, {summary['subtask_count']} subtasks)")
+
+        if args.expected_csv:
+            expected = pd.read_csv(args.expected_csv, low_memory=False)
+            if "task_id" not in expected.columns:
+                raise SystemExit(
+                    f"--expected-csv {args.expected_csv} has no 'task_id' column; "
+                    f"available columns: {list(expected.columns)}"
+                )
+            reconciliation = reconcile_task_inventory(inventory, expected)
+            summary["reconciliation"] = reconciliation
+            (output / "reconciliation.json").write_text(json.dumps(reconciliation, indent=2, default=str))
+            print("\nReconciliation against", args.expected_csv, ":")
+            print(f"  Expected total:  {reconciliation['expected_total']} "
+                  f"(tasks={reconciliation['expected_tasks']}, subtasks={reconciliation['expected_subtasks']})")
+            print(f"  Returned total:  {reconciliation['returned_total']} "
+                  f"(tasks={reconciliation['returned_tasks']}, subtasks={reconciliation['returned_subtasks']})")
+            print(f"  Missing:         {reconciliation['missing_count']}")
+            print(f"  Duplicates:      {reconciliation['duplicate_count']}")
+            print(f"  Unexpected:      {reconciliation['unexpected_count']}")
+            print(f"  Match %:         {reconciliation['match_percentage']}")
+
+        (output / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        print(f"\nWrote {output}/task_inventory.csv, summary.json"
+              + (", reconciliation.json" if args.expected_csv else ""))
+    elif args.command == "extract-project-hierarchy":
+        from wrike_status_api import WrikeClient, WrikePermissionError
+
+        client = WrikeClient(token())
+        candidates = client.find_projects_by_title(args.project_name)
+        exact = [
+            p
+            for p in candidates
+            if str(p.get("title") or "").strip().casefold() == args.project_name.strip().casefold()
+        ]
+
+        if not exact:
+            print(f"No project titled exactly {args.project_name!r} was found.")
+            if candidates:
+                print(
+                    f"Wrike's contains-match search for {args.project_name!r} found "
+                    f"{len(candidates)} similarly-named folder(s) instead (not pulled, "
+                    "since none is an exact name match):"
+                )
+                for c in candidates:
+                    print(f"  {c.get('id')}  {c.get('title')!r}")
+            raise SystemExit(1)
+
+        print(f"Found {len(exact)} project(s) titled exactly {args.project_name!r}:")
+        for p in exact:
+            print(f"  {p.get('id')}  {p.get('title')!r}")
+
+        status_names = client.status_names()
+        workflows = status_workflow_map(client)
+        try:
+            contacts = {
+                str(c["id"]): f"{c.get('firstName', '')} {c.get('lastName', '')}".strip()
+                for c in client.contacts()
+                if c.get("id")
+            }
+        except WrikePermissionError as exc:
+            print(f"WARNING: could not resolve contact names ({exc}); assignee/creator names will be blank.")
+            contacts = {}
+
+        output = dated_output_dir(args.output)
+        all_tables = []
+        for project in exact:
+            project_id = str(project.get("id"))
+            direct_tasks = client.tasks_in_folder(project_id)
+            tasks_by_id: dict[str, dict] = {str(t["id"]): t for t in direct_tasks if t.get("id")}
+
+            rounds = 0
+            while True:
+                missing = sorted(
                     {
-                        "effective_to": _bindable(close["EFFECTIVE_TO"]),
-                        "project_id": close["PROJECT_ID"],
-                        "effective_from": _bindable(close["EFFECTIVE_FROM"]),
-                    },
+                        str(sub_id)
+                        for task in tasks_by_id.values()
+                        for sub_id in (task.get("subTaskIds") or [])
+                        if str(sub_id) not in tasks_by_id
+                    }
                 )
-                closed += cursor.rowcount or 0
+                if not missing:
+                    break
+                rounds += 1
+                for fetched in client.tasks_batch(missing):
+                    if fetched.get("id"):
+                        tasks_by_id[str(fetched["id"])] = fetched
 
-            for insert in changes["rows_to_insert"]:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {FQN}
-                        (PROJECT_ID, PROJECT_NAME, STATUS_ID, STATUS_NAME,
-                         IS_CURRENT, EFFECTIVE_FROM, EFFECTIVE_TO, DETECTED_AT, SOURCE)
-                    VALUES
-                        (%(PROJECT_ID)s, %(PROJECT_NAME)s, %(STATUS_ID)s, %(STATUS_NAME)s,
-                         %(IS_CURRENT)s, %(EFFECTIVE_FROM)s, %(EFFECTIVE_TO)s, %(DETECTED_AT)s, %(SOURCE)s)
-                    """,
-                    {key: _bindable(value) for key, value in insert.items()},
+            table = build_task_hierarchy_table(
+                project_id=project_id,
+                project_name=project.get("title"),
+                tasks_by_id=tasks_by_id,
+                status_names=status_names,
+                contact_names=contacts,
+                status_workflows=workflows,
+            )
+            all_tables.append(table)
+
+            max_depth = int(table["hierarchy_depth"].max()) if not table.empty else 0
+            multi_parent = sum(1 for t in tasks_by_id.values() if len(t.get("superTaskIds") or []) > 1)
+
+            print(f"\nProject: {project.get('title')} ({project_id})")
+            print(f"  Direct GET /folders/{{id}}/tasks (descendants+subTasks=true) returned: {len(direct_tasks)}")
+            print(f"  Closure walk over subTaskIds: {rounds} round(s), "
+                  f"+{len(tasks_by_id) - len(direct_tasks)} additional task(s) found")
+            print(f"  Total tasks/subtasks (all depths): {len(tasks_by_id)}")
+            print(
+                "  Deepest hierarchy level reached: "
+                + (f"{max_depth} ({', '.join(HIERARCHY_LEVEL_NAMES[:max_depth])})" if max_depth else "0 (no tasks)")
+            )
+            if multi_parent:
+                print(
+                    f"  WARNING: {multi_parent} task(s) have more than one superTaskIds "
+                    "entry; only the first was used to place them in the hierarchy."
                 )
-                inserted += 1
 
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        combined = pd.concat(all_tables, ignore_index=True, sort=False) if all_tables else pd.DataFrame()
+        combined.to_csv(output / "project_hierarchy.csv", index=False)
+        print(f"\nWrote {output}/project_hierarchy.csv ({len(combined)} row(s) across {len(exact)} project(s))")
+    elif args.command == "classify-task-history":
+        from wrike_status_api import WrikeClient, WrikePermissionError
 
-    return {"rows_closed": closed, "rows_inserted": inserted}
+        client = WrikeClient(token())
+        status_names = client.status_names()
+
+        direct_tasks = client.tasks_in_folder(args.project_id)
+        tasks_by_id: dict[str, dict] = {str(t["id"]): t for t in direct_tasks if t.get("id")}
+        while True:
+            missing = sorted(
+                {
+                    str(sub_id)
+                    for task in tasks_by_id.values()
+                    for sub_id in (task.get("subTaskIds") or [])
+                    if str(sub_id) not in tasks_by_id
+                }
+            )
+            if not missing:
+                break
+            for fetched in client.tasks_batch(missing):
+                if fetched.get("id"):
+                    tasks_by_id[str(fetched["id"])] = fetched
+
+        # Actually attempt Audit Log live for this project rather than assuming
+        # the project-level 403 automatically applies to tasks too.
+        try:
+            client.audit_log(object_ids=[args.project_id], start="2000-01-01T00:00:00Z")
+            audit_log_blocked_reason = None
+        except WrikePermissionError as exc:
+            audit_log_blocked_reason = str(exc)
+
+        expected_ids = None
+        if args.expected_csv:
+            expected = pd.read_csv(args.expected_csv, low_memory=False)
+            if "task_id" not in expected.columns:
+                raise SystemExit(
+                    f"--expected-csv {args.expected_csv} has no 'task_id' column; "
+                    f"available columns: {list(expected.columns)}"
+                )
+            expected_ids = expected["task_id"].astype(str).tolist()
+
+        classification = classify_task_history_availability(
+            tasks_by_id=tasks_by_id,
+            status_names=status_names,
+            expected_task_ids=expected_ids,
+            audit_log_blocked_reason=audit_log_blocked_reason,
+        )
+
+        output = dated_output_dir(args.output)
+        classification.to_csv(output / "task_history_classification.csv", index=False)
+
+        counts = classification["classification"].value_counts().to_dict()
+        print(f"Classified {len(classification)} task(s)/subtask(s) under {args.project_id}:")
+        for label in sorted(counts):
+            print(f"  {label}: {counts[label]}")
+        if audit_log_blocked_reason:
+            print(f"\nAudit Log attempt: BLOCKED - {audit_log_blocked_reason}")
+        else:
+            print("\nAudit Log attempt: reachable - re-examine any non-CURRENT_STATUS_ONLY rows above.")
+        print(f"\nWrote {output}/task_history_classification.csv")
+    elif args.command == "bi-normalize":
+        history, diagnostics = normalize_bi_export(args.bi_dir)
+        write_outputs(history, Path(args.output), diagnostics)
+    elif args.command == "webhook-normalize":
+        payload = json.loads(Path(args.input).read_text())
+        events = payload if isinstance(payload, list) else [payload]
+        history = normalize_events(events, source=args.source)
+        synthetic = args.source.upper() != "WEBHOOK"
+        write_outputs(
+            history,
+            Path(args.output),
+            {
+                "source": args.source.upper(),
+                "synthetic": synthetic,
+                "warning": (
+                    "These rows were generated from fabricated sample events. The "
+                    "project_id is real but the dates and statuses are invented and "
+                    "do NOT reflect this project's actual Wrike history. Never present "
+                    "as retrieved data."
+                )
+                if synthetic
+                else None,
+            },
+        )
+        if synthetic:
+            print(
+                f"WARNING: source={args.source.upper()} — output contains FABRICATED "
+                "dates/statuses against a real project_id. Do not present as Wrike history."
+            )
+    elif args.command == "enrich-csv":
+        wrike_stg = pd.read_csv(args.wrike_stg, low_memory=False)
+        history = pd.read_csv(args.history, low_memory=False)
+        enriched = attach_to_project_rows(wrike_stg, history)
+        enriched.to_csv(args.output, index=False)
+        print(f"Input rows={len(wrike_stg)}; output rows={len(enriched)}; wrote {args.output}")
+    elif args.command == "register-webhook":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        hook_url = callback_url()
+        if not hook_url:
+            raise SystemExit("An approved callback URL is required")
+
+        events = args.events or ["ProjectStatusChanged"]
+        fields = args.fields or ["title", "customFields", "project"]
+        existing = [
+            hook
+            for hook in client.list_webhooks()
+            if hook.get("hookUrl") == hook_url
+            and str(hook.get("folderId") or "") == args.folder_id
+        ]
+
+        if existing and not args.force:
+            if args.secure:
+                raise SystemExit(
+                    "A matching webhook already exists, but Wrike does not reveal "
+                    "whether it uses a signing secret. Rerun without --secure to "
+                    "reuse it, or use --force only if a second registration is intended."
+                )
+            action = "reused_existing"
+            response = {"kind": "webhooks", "data": existing}
+        else:
+            secret = webhook_secret() if args.secure else None
+            if args.secure and not secret:
+                raise SystemExit("--secure requires a non-empty webhook signing secret")
+            action = "created"
+            response = client.register_webhook(
+                folder_id=args.folder_id,
+                hook_url=hook_url,
+                events=events,
+                fields=fields,
+                recursive=args.recursive,
+                secret=secret,
+            )
+
+        report = {
+            "action": action,
+            "folder_id": args.folder_id,
+            "events": events,
+            "fields": fields,
+            "recursive": args.recursive,
+            "secure_requested": args.secure,
+            "response": redact_webhook_response(response),
+        }
+        output = dated_output_dir(args.output)
+        (output / "webhook_registration_response.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        summary = [
+            {
+                "id": hook.get("id"),
+                "status": hook.get("status"),
+                "folderId": hook.get("folderId"),
+                "accountId": hook.get("accountId"),
+            }
+            for hook in response.get("data", [])
+        ]
+        print(f"Webhook registration action: {action}")
+        print(summary)
+        print(f"Wrote redacted evidence to {output}/webhook_registration_response.json")
+    elif args.command == "inspect-webhooks":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        raw_response = client.get("webhooks")
+        hooks = raw_response.get("data", [])
+        output = dated_output_dir(args.output)
+        (output / "webhooks_raw_response.json").write_text(
+            json.dumps(raw_response, indent=2, default=str)
+        )
+
+        # Unambiguous event-shaped fields only. Deliberately excludes "status"
+        # (a webhook subscription's own active/suspended flag, not a project
+        # status) and "customStatusId" (ambiguous without an old/new prefix).
+        historical_event_fields = {
+            "projectId",
+            "oldStatus",
+            "newStatus",
+            "oldCustomStatusId",
+            "newCustomStatusId",
+            "changedAt",
+            "eventDate",
+        }
+        fields_seen = sorted({key for hook in hooks for key in hook.keys()})
+        historical_fields_found = sorted(set(fields_seen) & historical_event_fields)
+
+        report = {
+            "endpoint": "GET /webhooks",
+            "subscriptions_returned": len(hooks),
+            "fields_seen": fields_seen,
+            "historical_event_fields_found": historical_fields_found,
+            "conclusion": (
+                "Unambiguous historical-event fields were present; re-examine the response."
+                if historical_fields_found
+                else (
+                    "No unambiguous historical-event fields (projectId/oldStatus/"
+                    "newStatus/changedAt/etc.) are present in this response. That "
+                    "alone is supporting, not conclusive, evidence. The decisive "
+                    "point is structural: this endpoint accepts no date-range, "
+                    "replay, or historical-event-retrieval parameters at all "
+                    "(contrast with audit_log(), which takes eventDate:{start,end}). "
+                    "A subscription-management resource has no mechanism to return "
+                    "events that occurred before the subscription existed, "
+                    "regardless of which fields a given response happens to contain."
+                )
+            ),
+        }
+        (output / "conclusion.json").write_text(json.dumps(report, indent=2))
+        print(f"Fetched {len(hooks)} webhook subscription(s).")
+        print(f"Fields present in response: {fields_seen}")
+        print(report["conclusion"])
+        print(f"Wrote raw response + conclusion to {output}/")
+    elif args.command == "map-statuses":
+        from wrike_status_api import CATALOG_COLUMNS, WrikeClient, flatten_workflows
+
+        client = WrikeClient(token())
+        payload = client.workflows_payload()
+        catalog = flatten_workflows(payload)
+        output = dated_output_dir(args.output)
+        (output / "workflows_raw_response.json").write_text(
+            json.dumps(payload, indent=2, default=str)
+        )
+        frame = pd.DataFrame(catalog, columns=CATALOG_COLUMNS)
+        frame.to_csv(output / "custom_status_catalog.csv", index=False)
+        (output / "custom_status_map.json").write_text(
+            json.dumps({row["custom_status_id"]: row["status_name"] for row in catalog}, indent=2)
+        )
+        print(f"Mapped {len(catalog)} custom statuses across "
+              f"{frame['workflow_id'].nunique() if not frame.empty else 0} workflow(s).")
+        if not frame.empty:
+            print(frame[["custom_status_id", "status_name", "status_group", "workflow_name"]].to_string(index=False))
+        print(f"Wrote catalog + raw response to {output}/")
+    elif args.command == "diagnose-access":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        checks = [
+            ("version", None, "Baseline: token authenticates at all"),
+            (f"folders/{args.project_id}", None, "Control project metadata (current state only)"),
+            ("workflows", {"includeSpaceWorkflow": "true"}, "customStatusId -> name mapping"),
+            ("webhooks", None, "Webhook subscriptions (future events only, no replay)"),
+            (
+                f"folders/{args.project_id}/comments",
+                None,
+                "NEW LEAD (untested) - does this reach the same activity feed shown in the Wrike UI?",
+            ),
+        ] + control_history_probe_specs(args.project_id)
+        results = []
+        for path, params, purpose in checks:
+            record = client.probe(path, params)
+            record["purpose"] = purpose
+            results.append(record)
+            state = "OK" if record.get("accessible") else f"HTTP {record.get('status_code')}"
+            print(f"  [{state:>8}] {record['endpoint']:<40} {purpose}")
+
+        historical = [r for r in results if r["purpose"].startswith("HISTORICAL")]
+        blocked = [r for r in historical if not r.get("accessible")]
+        report = {
+            "generated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "control_project_id": args.project_id,
+            "checks": results,
+            "historical_paths_blocked": len(blocked),
+            "historical_paths_total": len(historical),
+            "conclusion": (
+                "Both historical paths return non-200. Every endpoint that can return "
+                "past status transitions is unavailable to this token, so no backfill "
+                "is possible until one scope is granted. Endpoints that do respond "
+                "return current-state or subscription data only."
+                if len(blocked) == len(historical)
+                else "At least one historical path is now reachable — rerun the backfill."
+            ),
+        }
+        output = dated_output_dir(args.output)
+        (output / "access_diagnostics.json").write_text(json.dumps(report, indent=2, default=str))
+        pd.DataFrame(results).to_csv(output / "access_diagnostics.csv", index=False)
+        print(f"\n{report['conclusion']}")
+        print(f"Wrote dated evidence to {output}/access_diagnostics.json")
+    elif args.command == "verify-control":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        status_names = client.status_names()
+        history = pd.read_csv(args.history, low_memory=False) if args.history else None
+
+        access_checks = []
+        for path, params, purpose in control_history_probe_specs(args.project_id):
+            record = client.probe(path, params)
+            record["purpose"] = purpose
+            access_checks.append(record)
+
+        if args.expected:
+            expectations = parse_expected(args.expected)
+        elif args.project_id == CONTROL_PROJECT_ID:
+            expectations = list(CONTROL_EXPECTATIONS)
+        else:
+            expectations = []
+            print(
+                f"WARNING: --project-id {args.project_id} is not the control project "
+                f"({CONTROL_PROJECT_ID}) and no --expected was given. "
+                "CONTROL_EXPECTATIONS (May 26 / June 10) does NOT apply to this project - "
+                "reporting current-state facts only. Pass --expected 'Status:YYYY-MM-DD' "
+                "to check specific transitions for this project."
+            )
+
+        report, event_checks = verify_control_project(
+            project,
+            status_names=status_names,
+            history=history,
+            expectations=expectations,
+            access_checks=access_checks,
+        )
+        output = dated_output_dir(args.output)
+        (output / "control_verification.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        event_checks.to_csv(output / "control_event_checks.csv", index=False)
+        pd.DataFrame(access_checks).to_csv(output / "control_access_checks.csv", index=False)
+
+        print(f"Project: {report['control_project_name']} ({report['control_project_id']})")
+        print(f"Current status: {report['current_status_name']}")
+        for row in report["event_checks"]:
+            observed = row["observed_at"] or "not returned"
+            print(
+                f"  {row['expected_status']:<12} {row['expected_date']}  "
+                f"{row['result']:<32} observed={observed}"
+            )
+        for check in access_checks:
+            state = "OK" if check.get("accessible") else f"HTTP {check.get('status_code')}"
+            print(f"  {state:<8} {check['purpose']}")
+        print(f"Result: {report['acceptance_status']}")
+        print(report["conclusion"])
+        print(f"Wrote verification evidence to {output}/")
+    elif args.command == "inspect-project":
+        from wrike_status_api import (
+            WrikeClient,
+            describe_project_fields,
+            folder_hierarchy,
+            label_custom_fields,
+            label_folder_hierarchy,
+        )
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        fields = describe_project_fields(project)
+        definitions = client.custom_field_definitions()
+        custom_fields = label_custom_fields(project, definitions)
+        hierarchy = folder_hierarchy(project)
+        related_ids = hierarchy["parent_ids"] + hierarchy["child_ids"] + hierarchy["super_parent_ids"]
+        folders_payload = client.folders_batch(related_ids)
+        labeled_hierarchy = label_folder_hierarchy(hierarchy, folders_payload)
+        output = dated_output_dir(args.output)
+        (output / "project_raw_response.json").write_text(json.dumps(project, indent=2, default=str))
+        (output / "field_inventory.json").write_text(json.dumps(fields, indent=2, default=str))
+        (output / "custom_field_definitions_raw.json").write_text(json.dumps(definitions, indent=2, default=str))
+        (output / "custom_fields_labeled.json").write_text(json.dumps(custom_fields, indent=2, default=str))
+        (output / "folder_hierarchy.json").write_text(json.dumps(labeled_hierarchy, indent=2, default=str))
+
+        print(f"Project: {project.get('title')} ({args.project_id})\n")
+        for row in fields:
+            kind = (
+                "ACTUAL EVENT"
+                if row["is_actual_event"]
+                else "PLANNED/SCHEDULED (not an event)"
+                if row["is_planned_schedule_value"]
+                else "current-state field"
+            )
+            print(f"  {row['field_path']:<28} = {row['value']!r}")
+            print(f"    [{kind}] {row['meaning']}")
+        print(
+            "\nNone of these fields is a status-change history record — only "
+            "completedDate is tied to a specific transition. There is still no "
+            "field here that says when the status became 'In Progress'. That "
+            "requires Audit Log or BI Export."
+        )
+
+        print(f"\nCustom fields on this project ({len(custom_fields)}):")
+        if not custom_fields:
+            print("  (none set on this project)")
+        for row in custom_fields:
+            print(f"  {row['title']:<32} = {row['value']!r}  [{row['type']}, id={row['field_id']}]")
+
+        print(f"\nFolder hierarchy for {labeled_hierarchy['project_name']} ({labeled_hierarchy['project_id']}):")
+        for label, key in (("Super-parents", "super_parents"), ("Parents", "parents"), ("Children", "children")):
+            entries = labeled_hierarchy[key]
+            print(f"  {label} ({len(entries)}):")
+            if not entries:
+                print("    (none)")
+            for entry in entries:
+                print(f"    {entry['title']}  [id={entry['id']}]")
+
+        print(f"\nWrote raw response + labeled inventory + custom fields + hierarchy to {output}/")
+
+
+if __name__ == "__main__":
+    main()
+
