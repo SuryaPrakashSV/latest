@@ -1,45 +1,71 @@
 requests
 pandas
 snowflake-connector-python
+def _bindable(value: Any) -> Any:
+    """Convert a value coming out of pandas into something the Snowflake
+    connector's parameter binder actually recognizes.
 
-def snowflake_connection_from_env():
-    """Build a Snowflake connection from SNOWFLAKE_* env vars.
-
-    Supports two login styles, chosen by SNOWFLAKE_AUTHENTICATOR:
-      - unset/"snowflake" (default): plain username + password
-        (SNOWFLAKE_PASSWORD required)
-      - "externalbrowser": SSO login (e.g. AppleConnect/Okta) - opens a
-        browser window for you to complete the normal SSO login flow, no
-        password needed or stored anywhere. Use this if the only way you
-        access Snowsight is by clicking through to a company SSO page.
-
-    Imported lazily so the rest of this tool works without the
-    snowflake-connector-python package installed unless --apply or
-    --history-from-snowflake is actually used.
+    The connector picks a binder by the value's exact class name
+    (`type(value).__name__`), not by isinstance/subclass checks - so a
+    `pandas.Timestamp`, despite being a real `datetime.datetime` subclass,
+    is rejected with "Binding data in type (timestamp) is not supported"
+    unless it's converted to a plain `datetime.datetime` first. Every
+    EFFECTIVE_FROM/EFFECTIVE_TO/DETECTED_AT value here either comes straight
+    from `pd.Timestamp.now()` (incremental_load_core) or has passed through
+    a pandas DataFrame in fetch_current_rows(), so both insert and close
+    parameters need this, not just one or the other.
     """
-    import snowflake.connector
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.to_pydatetime()
+    if value is pd.NaT:
+        return None
+    return value
 
-    authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake").strip().lower()
-    base_required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_WAREHOUSE"]
-    required = base_required if authenticator == "externalbrowser" else base_required + ["SNOWFLAKE_PASSWORD"]
-    missing = [name for name in required if not os.getenv(name)]
-    if missing:
-        raise SystemExit(
-            f"Missing required environment variable(s) for Snowflake: {missing}. "
-            f"(authenticator={authenticator!r} - set SNOWFLAKE_AUTHENTICATOR=externalbrowser "
-            "instead if you log in via SSO/AppleConnect and don't have a password.)"
-        )
 
-    kwargs = dict(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        role=os.getenv("SNOWFLAKE_ROLE"),
-    )
-    if authenticator == "externalbrowser":
-        kwargs["authenticator"] = "externalbrowser"
-        print("Opening a browser window to complete SSO login - finish logging in there, then return here.")
-    else:
-        kwargs["password"] = os.environ["SNOWFLAKE_PASSWORD"]
+def apply_changes(connection, changes: dict[str, Any]) -> dict[str, int]:
+    """Apply rows_to_close (UPDATE) then rows_to_insert (INSERT) inside one
+    transaction, so a run either fully lands or fully rolls back - a partial
+    apply (rows closed but the replacement never inserted) would silently
+    lose the "current status" for that project.
+    """
+    closed = 0
+    inserted = 0
+    with connection.cursor() as cursor:
+        try:
+            for close in changes["rows_to_close"]:
+                cursor.execute(
+                    f"""
+                    UPDATE {FQN}
+                    SET EFFECTIVE_TO = %(effective_to)s, IS_CURRENT = FALSE
+                    WHERE PROJECT_ID = %(project_id)s
+                      AND EFFECTIVE_FROM = %(effective_from)s
+                      AND IS_CURRENT = TRUE
+                    """,
+                    {
+                        "effective_to": _bindable(close["EFFECTIVE_TO"]),
+                        "project_id": close["PROJECT_ID"],
+                        "effective_from": _bindable(close["EFFECTIVE_FROM"]),
+                    },
+                )
+                closed += cursor.rowcount or 0
 
-    return snowflake.connector.connect(**kwargs)
+            for insert in changes["rows_to_insert"]:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {FQN}
+                        (PROJECT_ID, PROJECT_NAME, STATUS_ID, STATUS_NAME,
+                         IS_CURRENT, EFFECTIVE_FROM, EFFECTIVE_TO, DETECTED_AT, SOURCE)
+                    VALUES
+                        (%(PROJECT_ID)s, %(PROJECT_NAME)s, %(STATUS_ID)s, %(STATUS_NAME)s,
+                         %(IS_CURRENT)s, %(EFFECTIVE_FROM)s, %(EFFECTIVE_TO)s, %(DETECTED_AT)s, %(SOURCE)s)
+                    """,
+                    {key: _bindable(value) for key, value in insert.items()},
+                )
+                inserted += 1
+
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {"rows_closed": closed, "rows_inserted": inserted}
