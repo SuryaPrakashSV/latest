@@ -1,2 +1,1 @@
-cd ~/Desktop/wrike_project_status_history/full_implementation
-python3 status_history_cli.py extract-task-inventory --project-id MQAAAAEGPpOb --expected-csv ~/Downloads/fr_mac_wrike_stg_export.csv --output task_inventory
+sed -i '' '1s/TASK_ID/task_id/' ~/Downloads/fr_mac_wrike_stg_export.csv
