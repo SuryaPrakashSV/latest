@@ -1,11 +1,25 @@
-SELECT DISTINCT
+SELECT
     "id" AS project_id,
     "title" AS project_name,
-    "status" AS general_status,
-    "customStatusId" AS custom_status_id
+    COUNT(*) AS source_rows,
+    COUNT(DISTINCT "customStatusId") AS distinct_task_statuses,
+    LISTAGG(DISTINCT "customStatusId", ', ')
+        WITHIN GROUP (ORDER BY "customStatusId") AS task_statuses,
+    COUNT(DISTINCT "parent_task_id") AS level_1_tasks,
+    COUNT(DISTINCT "child_task_id") AS level_2_tasks,
+    COUNT(DISTINCT "grandchild_task_id") AS level_3_tasks,
+    COUNT(DISTINCT "baby_task_id") AS level_4_tasks,
+    COUNT(DISTINCT "grandbaby_task_id") AS level_5_tasks,
+    COUNT(DISTINCT "great_grandbaby_task_id") AS level_6_tasks
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
 WHERE COALESCE(TRY_TO_BOOLEAN("is_project"), FALSE) = TRUE
   AND UPPER(TRIM(COALESCE("status", ''))) = 'ACTIVE'
   AND "id" <> 'MQAAAAEGPpOb'
-ORDER BY project_name
+GROUP BY "id", "title"
+HAVING COUNT(DISTINCT "customStatusId") >= 2
+ORDER BY
+    level_6_tasks DESC,
+    level_5_tasks DESC,
+    level_4_tasks DESC,
+    source_rows DESC
 LIMIT 20;
