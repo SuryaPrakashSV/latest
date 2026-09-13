@@ -1,15 +1,11 @@
-SELECT
-    COALESCE("grandchild_task_id", "child_task_id", "parent_task_id") AS task_id,
-    COALESCE("grandchild_task_title", "child_task_title", "parent_task_title") AS task_name,
-    "parent_task_id",
-    "child_task_id",
-    "grandchild_task_id",
-    "is_project",
-    "customStatusId",
-    "status",
-    "createdDate",
-    "updatedDate",
-    "completedDate"
+SELECT DISTINCT
+    "id" AS project_id,
+    "title" AS project_name,
+    "status" AS general_status,
+    "customStatusId" AS custom_status_id
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "title" LIKE '%FR Mac APR Update%'
-   OR "id" = 'MQAAAAEGPpOb';
+WHERE COALESCE(TRY_TO_BOOLEAN("is_project"), FALSE) = TRUE
+  AND UPPER(TRIM(COALESCE("status", ''))) = 'ACTIVE'
+  AND "id" <> 'MQAAAAEGPpOb'
+ORDER BY project_name
+LIMIT 20;
