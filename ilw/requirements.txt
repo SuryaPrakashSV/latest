@@ -1,4 +1,7 @@
-WITH top_task AS (
+SELECT
+    row_count,
+    COUNT(*) AS how_many_tasks_have_this_many_rows
+FROM (
     SELECT
         COALESCE(
             NULLIF("great_grandbaby_task_id", ''),
@@ -10,42 +13,15 @@ WITH top_task AS (
         ) AS task_id,
         COUNT(*) AS row_count
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = 'MQAAAABnIKFK'
-      AND COALESCE(
+    GROUP BY 1
+    HAVING COALESCE(
             NULLIF("great_grandbaby_task_id", ''),
             NULLIF("grandbaby_task_id", ''),
             NULLIF("baby_task_id", ''),
             NULLIF("grandchild_task_id", ''),
             NULLIF("child_task_id", ''),
             NULLIF("parent_task_id", '')
-          ) IS NOT NULL
-    GROUP BY 1
-    ORDER BY row_count DESC
-    LIMIT 1
+        ) IS NOT NULL
 )
-
-SELECT
-    COALESCE(
-        NULLIF("great_grandbaby_task_id", ''),
-        NULLIF("grandbaby_task_id", ''),
-        NULLIF("baby_task_id", ''),
-        NULLIF("grandchild_task_id", ''),
-        NULLIF("child_task_id", ''),
-        NULLIF("parent_task_id", '')
-    ) AS task_id,
-    "status",
-    "customStatusId",
-    "createdDate",
-    "updatedDate",
-    "completedDate"
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "id" = 'MQAAAABnIKFK'
-  AND COALESCE(
-        NULLIF("great_grandbaby_task_id", ''),
-        NULLIF("grandbaby_task_id", ''),
-        NULLIF("baby_task_id", ''),
-        NULLIF("grandchild_task_id", ''),
-        NULLIF("child_task_id", ''),
-        NULLIF("parent_task_id", '')
-    ) = (SELECT task_id FROM top_task)
-ORDER BY "updatedDate";
+GROUP BY row_count
+ORDER BY row_count DESC;
