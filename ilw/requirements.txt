@@ -1,27 +1,23 @@
-python3 status_history_cli.py extract-project-hierarchy \
-  --project-name "Apple Shopping Event (FY27)" \
-  --output apple_shopping_event_fy27
-
 WITH top_task AS (
     SELECT
         COALESCE(
-            "great_grandbaby_task_id",
-            "grandbaby_task_id",
-            "baby_task_id",
-            "grandchild_task_id",
-            "child_task_id",
-            "parent_task_id"
+            NULLIF("great_grandbaby_task_id", ''),
+            NULLIF("grandbaby_task_id", ''),
+            NULLIF("baby_task_id", ''),
+            NULLIF("grandchild_task_id", ''),
+            NULLIF("child_task_id", ''),
+            NULLIF("parent_task_id", '')
         ) AS task_id,
         COUNT(*) AS row_count
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE "id" = 'MQAAAABnIKFK'
       AND COALESCE(
-            "great_grandbaby_task_id",
-            "grandbaby_task_id",
-            "baby_task_id",
-            "grandchild_task_id",
-            "child_task_id",
-            "parent_task_id"
+            NULLIF("great_grandbaby_task_id", ''),
+            NULLIF("grandbaby_task_id", ''),
+            NULLIF("baby_task_id", ''),
+            NULLIF("grandchild_task_id", ''),
+            NULLIF("child_task_id", ''),
+            NULLIF("parent_task_id", '')
           ) IS NOT NULL
     GROUP BY 1
     ORDER BY row_count DESC
@@ -30,12 +26,12 @@ WITH top_task AS (
 
 SELECT
     COALESCE(
-        "great_grandbaby_task_id",
-        "grandbaby_task_id",
-        "baby_task_id",
-        "grandchild_task_id",
-        "child_task_id",
-        "parent_task_id"
+        NULLIF("great_grandbaby_task_id", ''),
+        NULLIF("grandbaby_task_id", ''),
+        NULLIF("baby_task_id", ''),
+        NULLIF("grandchild_task_id", ''),
+        NULLIF("child_task_id", ''),
+        NULLIF("parent_task_id", '')
     ) AS task_id,
     "status",
     "customStatusId",
@@ -43,30 +39,13 @@ SELECT
     "updatedDate",
     "completedDate"
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE COALESCE(
-        "great_grandbaby_task_id",
-        "grandbaby_task_id",
-        "baby_task_id",
-        "grandchild_task_id",
-        "child_task_id",
-        "parent_task_id"
+WHERE "id" = 'MQAAAABnIKFK'
+  AND COALESCE(
+        NULLIF("great_grandbaby_task_id", ''),
+        NULLIF("grandbaby_task_id", ''),
+        NULLIF("baby_task_id", ''),
+        NULLIF("grandchild_task_id", ''),
+        NULLIF("child_task_id", ''),
+        NULLIF("parent_task_id", '')
     ) = (SELECT task_id FROM top_task)
 ORDER BY "updatedDate";
-
-
-===============================================================
-SELECT
-    COALESCE(
-        "great_grandbaby_task_id",
-        "grandbaby_task_id",
-        "baby_task_id",
-        "grandchild_task_id",
-        "child_task_id",
-        "parent_task_id"
-    ) AS task_id,
-    COUNT(*) AS row_count
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "id" = 'MQAAAABnIKFK'
-GROUP BY 1
-ORDER BY row_count DESC
-LIMIT 1;
