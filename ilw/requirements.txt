@@ -1,5 +1,21 @@
-WITH task_rows AS (
-    SELECT
+"""Reconcile the live Wrike task-ID set for one project against Wrike_STG.
+
+Answers the exact gap the other model flagged: matching COUNT(*) alone does
+not prove the same tasks matched. This computes the real set difference -
+API-only task IDs (missing from Snowflake), Snowflake-only task IDs
+(orphans/extra), and the matched set - not just totals.
+
+Usage:
+    python3 reconcile_task_ids.py \
+        --project-id MQAAAABnIKFK \
+        --project-name "ASA OS Compatibility" \
+        --snowflake-csv asa_os_task_ids.csv \
+        --output output/task_reconciliation
+
+The Snowflake CSV needs at least a `task_id` column. Export it from
+Snowsight with (note: DISTINCT task_id LIST, not an aggregate count):
+
+    SELECT DISTINCT
         COALESCE(
             NULLIF(TRIM("great_grandbaby_task_id"), ''),
             NULLIF(TRIM("grandbaby_task_id"), ''),
@@ -7,27 +23,121 @@ WITH task_rows AS (
             NULLIF(TRIM("grandchild_task_id"), ''),
             NULLIF(TRIM("child_task_id"), ''),
             NULLIF(TRIM("parent_task_id"), '')
-        ) AS task_id,
-        "customStatusId" AS status_value
+        ) AS task_id
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-),
-per_task AS (
-    SELECT
-        task_id,
-        COUNT(*) AS row_count,
-        COUNT(DISTINCT status_value) AS distinct_non_null_statuses
-    FROM task_rows
-    WHERE task_id IS NOT NULL
-    GROUP BY task_id
-)
-SELECT
-    CASE
-        WHEN row_count = 1 THEN '1 row - no duplicates'
-        WHEN distinct_non_null_statuses = 0 THEN 'duplicated rows, status NULL on all of them'
-        WHEN distinct_non_null_statuses = 1 THEN 'duplicated rows, SAME status every time'
-        ELSE 'duplicated rows, status DIFFERS across them'
-    END AS category,
-    COUNT(*) AS num_tasks
-FROM per_task
-GROUP BY category
-ORDER BY num_tasks DESC;
+    WHERE "id" = '<project id>'
+    QUALIFY task_id IS NOT NULL;
+
+then download the result grid as CSV. Run this script once per project.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import getpass
+import os
+from pathlib import Path
+
+import requests
+
+API_BASE = "https://www.wrike.com/api/v4"
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def all_task_ids_for_project(project_id: str, tok: str) -> set[str]:
+    """Closure-walk subTaskIds so every task/subtask under the project is
+    found regardless of nesting depth - same approach used for the earlier
+    task-history classification work, so this stays comparable to it.
+    """
+    headers = {"Authorization": f"Bearer {tok}"}
+    resp = requests.get(
+        f"{API_BASE}/folders/{project_id}/tasks",
+        headers=headers,
+        params={
+            "descendants": "true",
+            "subTasks": "true",
+            "fields": '["subTaskIds","superTaskIds"]',
+        },
+    )
+    resp.raise_for_status()
+    tasks = resp.json()["data"]
+
+    seen: set[str] = set()
+    frontier: set[str] = set()
+    for task in tasks:
+        seen.add(task["id"])
+        frontier.update(task.get("subTaskIds") or [])
+    frontier -= seen
+
+    while frontier:
+        batch = list(frontier)[:100]
+        ids_param = ",".join(batch)
+        resp = requests.get(
+            f"{API_BASE}/tasks/{ids_param}",
+            headers=headers,
+            params={"fields": '["subTaskIds"]'},
+        )
+        resp.raise_for_status()
+        for task in resp.json()["data"]:
+            seen.add(task["id"])
+            frontier.update(task.get("subTaskIds") or [])
+        frontier -= seen
+
+    return seen
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--project-name", default="")
+    parser.add_argument(
+        "--snowflake-csv", required=True, help="CSV export with a task_id column (see module docstring)"
+    )
+    parser.add_argument("--output", default="output/task_reconciliation")
+    args = parser.parse_args()
+
+    tok = token()
+    print(f"Pulling live task IDs for project {args.project_id} from Wrike...")
+    api_ids = all_task_ids_for_project(args.project_id, tok)
+
+    with open(args.snowflake_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        snowflake_ids = {
+            row["task_id"].strip() for row in reader if row.get("task_id", "").strip()
+        }
+
+    api_only = api_ids - snowflake_ids
+    snowflake_only = snowflake_ids - api_ids
+    matched = api_ids & snowflake_ids
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = args.project_id
+
+    for name, ids in [
+        ("matched", matched),
+        ("api_only_missing_from_snowflake", api_only),
+        ("snowflake_only_orphans", snowflake_only),
+    ]:
+        with open(output_dir / f"{stem}_{name}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["task_id"])
+            for task_id in sorted(ids):
+                writer.writerow([task_id])
+
+    print(f"\nProject: {args.project_name or args.project_id}")
+    print(f"Wrike API task count:          {len(api_ids)}")
+    print(f"Snowflake distinct task count: {len(snowflake_ids)}")
+    print(f"Matched:                       {len(matched)}")
+    print(f"API-only (missing in SF):      {len(api_only)}")
+    print(f"Snowflake-only (orphans):      {len(snowflake_only)}")
+    print(f"\nWrote detail CSVs to {output_dir}/")
+
+
+if __name__ == "__main__":
+    main()
