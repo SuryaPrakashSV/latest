@@ -1,3 +1,10 @@
-sed -i '' 's/with open(args.snowflake_csv, newline="") as f:/with open(args.snowflake_csv, newline="", encoding="utf-8-sig") as f:/' reconsile_task_ids.py
-grep -n "snowflake_csv" reconsile_task_ids.py
-python3 reconsile_task_ids.py --project-id MQAAAABnlKFK --project-name "ASA OS Compatibility" --snowflake-csv asa_task_ids.csv
+SELECT
+    "id" AS project_id,
+    "title" AS project_name
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE COALESCE(TRY_TO_BOOLEAN("is_project"), FALSE) = TRUE
+  AND (
+    "title" ILIKE 'Apple Shopping Event (FY27)%'
+    OR "title" ILIKE 'Holiday (FY27)%'
+  )
+GROUP BY "id", "title";
