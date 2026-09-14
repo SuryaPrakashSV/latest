@@ -23,3 +23,26 @@ WHERE COALESCE(
         "parent_task_id"
     ) = '<paste the exact task_id from the top row here>'
 ORDER BY "updatedDate";
+
+
+WITH project_tasks AS (
+    SELECT
+        COALESCE(
+            "great_grandbaby_task_id",
+            "grandbaby_task_id",
+            "baby_task_id",
+            "grandchild_task_id",
+            "child_task_id",
+            "parent_task_id"
+        ) AS task_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" = 'MQAAAABnlKFK'
+)
+SELECT
+    task_id,
+    COUNT(*) AS row_count
+FROM project_tasks
+WHERE task_id IS NOT NULL
+GROUP BY task_id
+ORDER BY row_count DESC
+LIMIT 10;
