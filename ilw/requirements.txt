@@ -1,1 +1,8 @@
-python3 insepect_missing_tasks.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+        resp = requests.get(
+            f"{API_BASE}/tasks/{ids_param}",
+            headers=headers,
+            params={"fields": '["superTaskIds","title"]'},
+        )
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
+        resp.raise_for_status()
