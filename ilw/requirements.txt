@@ -1,12 +1,1 @@
-    with open(args.snowflake_csv, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
-        task_id_key = fieldnames.get("task_id")
-        if task_id_key is None:
-            raise SystemExit(
-                f"Could not find a 'task_id' column in {args.snowflake_csv}. "
-                f"Found columns: {reader.fieldnames}"
-            )
-        snowflake_ids = {
-            row[task_id_key].strip() for row in reader if row.get(task_id_key, "").strip()
-        }
+cat output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
