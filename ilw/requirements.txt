@@ -1,27 +1,33 @@
-SELECT
-    row_count,
-    COUNT(*) AS how_many_tasks_have_this_many_rows
-FROM (
+WITH task_rows AS (
     SELECT
         COALESCE(
-            NULLIF("great_grandbaby_task_id", ''),
-            NULLIF("grandbaby_task_id", ''),
-            NULLIF("baby_task_id", ''),
-            NULLIF("grandchild_task_id", ''),
-            NULLIF("child_task_id", ''),
-            NULLIF("parent_task_id", '')
+            NULLIF(TRIM("great_grandbaby_task_id"), ''),
+            NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''),
+            NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''),
+            NULLIF(TRIM("parent_task_id"), '')
         ) AS task_id,
-        COUNT(*) AS row_count
+        "customStatusId" AS status_value
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    GROUP BY 1
-    HAVING COALESCE(
-            NULLIF("great_grandbaby_task_id", ''),
-            NULLIF("grandbaby_task_id", ''),
-            NULLIF("baby_task_id", ''),
-            NULLIF("grandchild_task_id", ''),
-            NULLIF("child_task_id", ''),
-            NULLIF("parent_task_id", '')
-        ) IS NOT NULL
+),
+per_task AS (
+    SELECT
+        task_id,
+        COUNT(*) AS row_count,
+        COUNT(DISTINCT status_value) AS distinct_non_null_statuses
+    FROM task_rows
+    WHERE task_id IS NOT NULL
+    GROUP BY task_id
 )
-GROUP BY row_count
-ORDER BY row_count DESC;
+SELECT
+    CASE
+        WHEN row_count = 1 THEN '1 row - no duplicates'
+        WHEN distinct_non_null_statuses = 0 THEN 'duplicated rows, status NULL on all of them'
+        WHEN distinct_non_null_statuses = 1 THEN 'duplicated rows, SAME status every time'
+        ELSE 'duplicated rows, status DIFFERS across them'
+    END AS category,
+    COUNT(*) AS num_tasks
+FROM per_task
+GROUP BY category
+ORDER BY num_tasks DESC;
