@@ -2,45 +2,31 @@ python3 status_history_cli.py extract-project-hierarchy \
   --project-name "Apple Shopping Event (FY27)" \
   --output apple_shopping_event_fy27
 
-Then run:
-
-python3 status_history_cli.py extract-project-hierarchy \
-  --project-name "Holiday (FY27)" \
-  --output holiday_fy27
-SELECT
-    "status",
-    "customStatusId",
-    "createdDate",
-    "updatedDate",
-    "completedDate"
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE COALESCE(
-        "great_grandbaby_task_id",
-        "grandbaby_task_id",
-        "baby_task_id",
-        "grandchild_task_id",
-        "child_task_id",
-        "parent_task_id"
-    ) = '<paste the exact task_id from the top row here>'
-ORDER BY "updatedDate";
 
 WITH project_tasks AS (
     SELECT
+        "id" AS project_id,
+        "title" AS project_name,
         COALESCE(
-            "great_grandbaby_task_id",
-            "grandbaby_task_id",
-            "baby_task_id",
-            "grandchild_task_id",
-            "child_task_id",
-            "parent_task_id"
+            NULLIF(TRIM("great_grandbaby_task_id"), ''),
+            NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''),
+            NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''),
+            NULLIF(TRIM("parent_task_id"), '')
         ) AS task_id,
         "status",
         "customStatusId",
         "updatedDate"
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = 'MQAAAABnlKFK'
+    WHERE "title" IN (
+        'Apple Shopping Event (FY27)',
+        'Holiday (FY27)'
+    )
 )
 SELECT
+    project_id,
+    project_name,
     task_id,
     "status",
     "customStatusId",
@@ -48,5 +34,10 @@ SELECT
     COUNT(*) AS row_count
 FROM project_tasks
 WHERE task_id IS NOT NULL
-GROUP BY task_id, "status", "customStatusId"
-ORDER BY row_count DESC;
+GROUP BY
+    project_id,
+    project_name,
+    task_id,
+    "status",
+    "customStatusId"
+ORDER BY project_name, latest_updated_date DESC;
