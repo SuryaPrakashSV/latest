@@ -1,37 +1,21 @@
-"""Check whether tasks missing from Wrike_STG cluster at a particular
-hierarchy depth (subtasks of subtasks) - the leading hypothesis for why a
-small project (11/11 matched) reconciled perfectly while a large project
-(316 API tasks, only 193 in Snowflake) shows a 123-task gap.
+"""Quick one-task probe: which of these field names are valid EXPLICIT
+optional fields on GET /tasks/{id}?
 
-For each missing task, this looks at its immediate `superTaskIds` (its
-direct parent task, if any - not the full depth to the project root, just
-whether it's nested at all vs. sitting directly under the project folder).
-If the missing tasks are overwhelmingly "has a superTaskId" while the tasks
-that DID make it into Snowflake are overwhelmingly top-level, that's strong
-evidence the production extraction's hierarchy walk is dropping deeper
-subtasks - the same class of bug hit earlier in this project before the
-closure-walk over subTaskIds was added.
-
-Includes rate-limit backoff: Wrike's `fields` parameter rejects
-superTaskIds/title as explicit optional fields on this bulk endpoint (they
-come back by default instead), and repeated calls can hit Wrike's ~400
-requests/minute cap, so requests retry with backoff respecting any
-`Retry-After` header instead of failing immediately.
+We already have confirmed, literal proof that 'title' and 'superTaskIds'
+are REJECTED when requested explicitly on this endpoint (they come back by
+default instead) - see the two 400 errors already hit and fixed earlier in
+this project. Before building a full hierarchy diagnostic across all 316
+Holiday tasks using parentIds/superParentIds/subTaskIds, check each one
+individually against a single real task ID, so we don't repeat that same
+trial-and-error cycle at scale.
 
 Usage:
-    python3 inspect_missing_tasks.py \
-        --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+    python3 probe_fields.py
+    (it will ask for a task ID interactively)
 """
 
-from __future__ import annotations
-
-import argparse
-import csv
 import getpass
 import os
-import time
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -43,98 +27,27 @@ def token() -> str:
     return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
 
 
-def chunked(items, size):
-    items = list(items)
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def read_task_ids(csv_path: str) -> list[str]:
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
-        key = fieldnames.get("task_id")
-        if key is None:
-            raise SystemExit(f"No task_id column found in {csv_path}. Columns: {reader.fieldnames}")
-        return [row[key].strip() for row in reader if row.get(key, "").strip()]
-
-
-def get_with_backoff(url, headers, max_retries=6, timeout=60):
-    """GET with retry/backoff on HTTP 429, respecting Retry-After (seconds
-    or HTTP-date) when Wrike sends one, falling back to exponential backoff
-    otherwise. Returns the last response either way - the caller's own
-    resp.raise_for_status() handles a final, still-failing attempt.
-    """
-    for attempt in range(max_retries):
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        if resp.status_code != 429 or attempt == max_retries - 1:
-            return resp
-
-        retry_after = resp.headers.get("Retry-After")
-        wait = None
-        if retry_after:
-            try:
-                wait = max(0.0, float(retry_after))
-            except ValueError:
-                try:
-                    retry_dt = parsedate_to_datetime(retry_after)
-                    if retry_dt.tzinfo is None:
-                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
-                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
-                except (TypeError, ValueError):
-                    wait = None
-        if wait is None:
-            wait = min(120, 5 * (2 ** attempt))
-
-        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
-        time.sleep(wait)
-
-    return resp
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--missing-csv", required=True)
-    args = parser.parse_args()
-
-    missing_ids = read_task_ids(args.missing_csv)
     tok = token()
     headers = {"Authorization": f"Bearer {tok}"}
 
-    has_super = 0
-    no_super = 0
-    parent_count_dist: dict[int, int] = {}
-    sample_top_level_titles: list[str] = []
+    sample_task_id = input("Paste one real task ID to probe against: ").strip()
 
-    for batch in chunked(missing_ids, 100):
-        ids_param = ",".join(batch)
-        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers)
-        if not resp.ok:
-            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
-        resp.raise_for_status()
+    candidate_fields = ["parentIds", "superParentIds", "subTaskIds", "superTaskIds", "title"]
 
-        for task in resp.json()["data"]:
-            supers = task.get("superTaskIds") or []
-            parent_count_dist[len(supers)] = parent_count_dist.get(len(supers), 0) + 1
-            if supers:
-                has_super += 1
-            else:
-                no_super += 1
-                if len(sample_top_level_titles) < 10:
-                    sample_top_level_titles.append(task.get("title", "<no title>"))
-
-    total = len(missing_ids)
-    print(f"Missing tasks checked: {total}")
-    print(f"Has >=1 superTaskId (nested under another task): {has_super} ({has_super / total:.0%})")
-    print(f"No superTaskIds (sits directly under the project): {no_super} ({no_super / total:.0%})")
-    print("\nImmediate-parent-count distribution:")
-    for count, num in sorted(parent_count_dist.items()):
-        print(f"  {count} parent(s): {num} tasks")
-
-    if sample_top_level_titles:
-        print("\nSample titles of the top-level (no superTaskId) missing tasks:")
-        for title in sample_top_level_titles:
-            print(f"  - {title}")
+    print(f"\nProbing {sample_task_id} field-by-field...\n")
+    for field in candidate_fields:
+        resp = requests.get(
+            f"{API_BASE}/tasks/{sample_task_id}",
+            headers=headers,
+            params={"fields": f'["{field}"]'},
+        )
+        if resp.ok:
+            data = resp.json()["data"][0]
+            present_keys = sorted(data.keys())
+            print(f"{field}: OK (accepted). Full response keys: {present_keys}")
+        else:
+            print(f"{field}: REJECTED - {resp.text}")
 
 
 if __name__ == "__main__":
