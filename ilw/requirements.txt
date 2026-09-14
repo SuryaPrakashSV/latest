@@ -1,1 +1,2 @@
+cd ~/Desktop/wrike_incremental_load
 python3 reconcile_task_ids.py --project-id MQAAAABnlKFK --project-name "ASA OS Compatibility" --snowflake-csv asa_task_ids.csv
