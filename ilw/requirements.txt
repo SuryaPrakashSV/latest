@@ -1,15 +1,19 @@
-"""Check whether the 123 tasks missing from Snowflake were created recently
-enough that normal 2-hour full-load latency (not a defect) could explain the
-gap, before doing a more expensive table-wide search across all of
-Wrike_STG.
+"""Table-wide search: do any of the 123 tasks 'missing from Snowflake' for
+Holiday actually appear ANYWHERE ELSE in Wrike_STG - under some different
+project entirely?
 
-Pulls createdDate/updatedDate for all 123 and reports the distribution -
-if most were created within the last few hours, that's a timing/freshness
-explanation, not a bug. If most are old (days/weeks), timing doesn't
-explain it and the table-wide search becomes the necessary next step.
+Connects directly to Snowflake (reusing the same SNOWFLAKE_* env-var pattern
+already used elsewhere in this project) and loads the local CSV of missing
+IDs into a temporary table, then joins it against a full-table (no project
+filter) union of every hierarchy column. This avoids retyping any of the
+123 IDs by hand - they go straight from the CSV file into Snowflake.
+
+Requires the same SNOWFLAKE_* environment variables already used for
+ensure-table/run: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_WAREHOUSE,
+SNOWFLAKE_ROLE, and SNOWFLAKE_AUTHENTICATOR=externalbrowser for SSO.
 
 Usage:
-    python3 check_creation_timing.py \
+    python3 table_wide_search.py \
         --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
 """
 
@@ -17,26 +21,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import getpass
 import os
-import time
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 
-import requests
-
-API_BASE = "https://www.wrike.com/api/v4"
-
-
-def token() -> str:
-    value = os.getenv("WRIKE_TOKEN", "").strip()
-    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
-
-
-def chunked(items, size):
-    items = list(items)
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
+TABLE_FQN = 'GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"'
 
 
 def read_task_ids(csv_path: str) -> list[str]:
@@ -49,29 +36,33 @@ def read_task_ids(csv_path: str) -> list[str]:
         return [row[key].strip() for row in reader if row.get(key, "").strip()]
 
 
-def get_with_backoff(url, headers, max_retries=6, timeout=60):
-    for attempt in range(max_retries):
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        if resp.status_code != 429 or attempt == max_retries - 1:
-            return resp
-        retry_after = resp.headers.get("Retry-After")
-        wait = None
-        if retry_after:
-            try:
-                wait = max(0.0, float(retry_after))
-            except ValueError:
-                try:
-                    retry_dt = parsedate_to_datetime(retry_after)
-                    if retry_dt.tzinfo is None:
-                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
-                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
-                except (TypeError, ValueError):
-                    wait = None
-        if wait is None:
-            wait = min(120, 5 * (2 ** attempt))
-        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
-        time.sleep(wait)
-    return resp
+def snowflake_connection_from_env():
+    import snowflake.connector
+
+    authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake").strip().lower()
+    base_required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_WAREHOUSE"]
+    required = base_required if authenticator == "externalbrowser" else base_required + ["SNOWFLAKE_PASSWORD"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise SystemExit(
+            f"Missing required environment variable(s) for Snowflake: {missing}. "
+            f"(authenticator={authenticator!r} - set SNOWFLAKE_AUTHENTICATOR=externalbrowser "
+            "for SSO/AppleConnect login, same as before.)"
+        )
+
+    kwargs = dict(
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        user=os.environ["SNOWFLAKE_USER"],
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        role=os.getenv("SNOWFLAKE_ROLE"),
+    )
+    if authenticator == "externalbrowser":
+        kwargs["authenticator"] = "externalbrowser"
+        print("Opening a browser window to complete SSO login - finish logging in there, then return here.")
+    else:
+        kwargs["password"] = os.environ["SNOWFLAKE_PASSWORD"]
+
+    return snowflake.connector.connect(**kwargs)
 
 
 def main() -> None:
@@ -80,89 +71,60 @@ def main() -> None:
     args = parser.parse_args()
 
     missing_ids = read_task_ids(args.missing_csv)
-    tok = token()
-    headers = {"Authorization": f"Bearer {tok}"}
+    print(f"Loaded {len(missing_ids)} missing task IDs from {args.missing_csv}")
 
-    now = datetime.now(timezone.utc)
-    buckets = {
-        "< 2 hours old": 0,
-        "2-24 hours old": 0,
-        "1-7 days old": 0,
-        "> 7 days old": 0,
-        "unparseable": 0,
-    }
-    oldest = None
-    newest = None
+    connection = snowflake_connection_from_env()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE OR REPLACE TEMPORARY TABLE TEMP_MISSING_HOLIDAY_TASKS (task_id VARCHAR)"
+            )
+            cursor.executemany(
+                "INSERT INTO TEMP_MISSING_HOLIDAY_TASKS (task_id) VALUES (%(task_id)s)",
+                [{"task_id": task_id} for task_id in missing_ids],
+            )
+            print(f"Loaded {len(missing_ids)} IDs into a session-scoped temporary Snowflake table.")
 
-    for batch in chunked(missing_ids, 100):
-        ids_param = ",".join(batch)
-        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers)
-        if not resp.ok:
-            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
-        resp.raise_for_status()
+            query = f"""
+                WITH all_hierarchy AS (
+                    SELECT "id" AS owning_id, "title" AS owning_title, NULLIF(TRIM("parent_task_id"), '') AS task_id
+                    FROM {TABLE_FQN}
+                    UNION ALL
+                    SELECT "id", "title", NULLIF(TRIM("child_task_id"), '') FROM {TABLE_FQN}
+                    UNION ALL
+                    SELECT "id", "title", NULLIF(TRIM("grandchild_task_id"), '') FROM {TABLE_FQN}
+                    UNION ALL
+                    SELECT "id", "title", NULLIF(TRIM("baby_task_id"), '') FROM {TABLE_FQN}
+                    UNION ALL
+                    SELECT "id", "title", NULLIF(TRIM("grandbaby_task_id"), '') FROM {TABLE_FQN}
+                    UNION ALL
+                    SELECT "id", "title", NULLIF(TRIM("great_grandbaby_task_id"), '') FROM {TABLE_FQN}
+                )
+                SELECT DISTINCT m.task_id, a.owning_id, a.owning_title
+                FROM TEMP_MISSING_HOLIDAY_TASKS m
+                LEFT JOIN all_hierarchy a ON a.task_id = m.task_id
+                ORDER BY m.task_id
+            """
+            print("Running the table-wide search (scans the entire Wrike_STG table - may take a bit)...")
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
-        for task in resp.json()["data"]:
-            created_raw = task.get("createdDate")
-            if not created_raw:
-                buckets["unparseable"] += 1
-                continue
-            try:
-                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-            except ValueError:
-                buckets["unparseable"] += 1
-                continue
+        results = [dict(zip(columns, row)) for row in rows]
+        found_elsewhere = [r for r in results if r.get("OWNING_ID") is not None]
+        truly_absent = [r for r in results if r.get("OWNING_ID") is None]
 
-            age = now - created
-            if oldest is None or created < oldest:
-                oldest = created
-            if newest is None or created > newest:
-                newest = created
+        print(f"\nTotal checked: {len(results)}")
+        print(f"Found under SOME project in Wrike_STG: {len(found_elsewhere)}")
+        print(f"Truly absent anywhere in Wrike_STG:     {len(truly_absent)}")
 
-            if age.total_seconds() < 2 * 3600:
-                buckets["< 2 hours old"] += 1
-            elif age.total_seconds() < 24 * 3600:
-                buckets["2-24 hours old"] += 1
-            elif age.total_seconds() < 7 * 24 * 3600:
-                buckets["1-7 days old"] += 1
-            else:
-                buckets["> 7 days old"] += 1
-
-    total = len(missing_ids)
-    print(f"Missing tasks checked: {total}\n")
-    print("Age distribution (createdDate vs now):")
-    for label, count in buckets.items():
-        print(f"  {label}: {count} ({count / total:.0%})")
-
-    if oldest and newest:
-        print(f"\nOldest missing task created: {oldest.isoformat()}")
-        print(f"Newest missing task created: {newest.isoformat()}")
+        if found_elsewhere:
+            print("\nSample of tasks found elsewhere, and under which project:")
+            for r in found_elsewhere[:15]:
+                print(f"  {r['TASK_ID']} -> owning_id={r['OWNING_ID']} ({r['OWNING_TITLE']})")
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":
     main()
-
-
-
-python3 check_creation_timing.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
-
-
-
-
-WITH all_hierarchy AS (
-    SELECT "id" AS owning_id, "title" AS owning_title, NULLIF(TRIM("parent_task_id"), '') AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNION ALL
-    SELECT "id", "title", NULLIF(TRIM("child_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNION ALL
-    SELECT "id", "title", NULLIF(TRIM("grandchild_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNION ALL
-    SELECT "id", "title", NULLIF(TRIM("baby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNION ALL
-    SELECT "id", "title", NULLIF(TRIM("grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNION ALL
-    SELECT "id", "title", NULLIF(TRIM("great_grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-)
-SELECT DISTINCT m.task_id, a.owning_id, a.owning_title
-FROM TEMP_MISSING_HOLIDAY_TASKS m
-LEFT JOIN all_hierarchy a ON a.task_id = m.task_id
-ORDER BY m.task_id;
