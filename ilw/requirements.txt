@@ -1,23 +1,35 @@
-"""
-Quick one-task probe.
+"""Re-check whether the 123 tasks that were 'missing from Snowflake' still
+exist in Wrike right now.
 
-Purpose:
-Make one plain GET /tasks/{id} request with NO explicit `fields` parameter
-and inspect which hierarchy-related fields Wrike returns by default.
+inspect_missing_tasks.py already successfully bulk-fetched all 123 of these
+IDs earlier (113 nested + 10 top-level = 123, no errors) - meaning every one
+of them was live and accessible at that time. A follow-up single-ID probe on
+one of them (MAAAAAE06vyQ) just came back 404 "Task not found or access
+denied" - it was deleted or made inaccessible sometime between that bulk run
+and now.
+
+This re-runs the same bulk fetch and compares how many IDs still come back
+vs. how many are now silently missing from the response (Wrike's bulk
+endpoint appears to omit inaccessible/deleted IDs rather than erroring the
+whole batch - that's how the earlier run succeeded even though one of its
+123 IDs is now gone). The delta tells us how much of the original
+reconciliation gap is explained by churn (tasks deleted after being pulled
+live) rather than a real hierarchy-walk or folder-scoping defect.
 
 Usage:
-    python3 probe_fields.py
-
-The script will:
-1. Ask for the Wrike token using a hidden prompt if WRIKE_TOKEN is not set.
-2. Ask for one real task ID.
-3. Make one GET /tasks/{task_id} request.
-4. Print every key returned by Wrike.
-5. Specifically show whether the hierarchy fields we care about are present.
+    python3 recheck_existence.py \
+        --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
 """
 
+from __future__ import annotations
+
+import argparse
+import csv
 import getpass
 import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -26,70 +38,93 @@ API_BASE = "https://www.wrike.com/api/v4"
 
 def token() -> str:
     value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
 
-    if value:
-        return value
 
-    return getpass.getpass(
-        "Wrike token (hidden; not saved): "
-    ).strip()
+def chunked(items, size):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def read_task_ids(csv_path: str) -> list[str]:
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        key = fieldnames.get("task_id")
+        if key is None:
+            raise SystemExit(f"No task_id column found in {csv_path}. Columns: {reader.fieldnames}")
+        return [row[key].strip() for row in reader if row.get(key, "").strip()]
+
+
+def get_with_backoff(url, headers, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--missing-csv", required=True)
+    args = parser.parse_args()
+
+    missing_ids = read_task_ids(args.missing_csv)
     tok = token()
+    headers = {"Authorization": f"Bearer {tok}"}
 
-    headers = {
-        "Authorization": f"Bearer {tok}"
-    }
+    still_exists: set[str] = set()
 
-    task_id = input(
-        "Paste one real task ID to probe against: "
-    ).strip()
+    for batch in chunked(missing_ids, 100):
+        ids_param = ",".join(batch)
+        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers)
+        if resp.status_code == 404:
+            # Whole batch came back not-found - fall back to one-by-one for this batch.
+            for task_id in batch:
+                single = get_with_backoff(f"{API_BASE}/tasks/{task_id}", headers)
+                if single.ok:
+                    still_exists.add(task_id)
+            continue
 
-    if not task_id:
-        raise SystemExit("Task ID cannot be blank.")
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
+        resp.raise_for_status()
 
-    print(f"\nFetching default response for task: {task_id}\n")
+        for task in resp.json()["data"]:
+            still_exists.add(task["id"])
 
-    resp = requests.get(
-        f"{API_BASE}/tasks/{task_id}",
-        headers=headers,
-        timeout=30,
-    )
+    now_gone = set(missing_ids) - still_exists
 
-    if not resp.ok:
-        print(f"Request failed: HTTP {resp.status_code}")
-        print(resp.text)
-        return
+    print(f"Originally missing from Snowflake: {len(missing_ids)}")
+    print(f"Still exist in Wrike right now:     {len(still_exists)}")
+    print(f"No longer exist / inaccessible now: {len(now_gone)} ({len(now_gone) / len(missing_ids):.0%})")
 
-    payload = resp.json()
-    data = payload.get("data", [])
-
-    if not data:
-        print("Request succeeded, but Wrike returned no task data.")
-        return
-
-    task = data[0]
-
-    print("All keys in the default response:")
-    print(sorted(task.keys()))
-
-    print("\nHierarchy / task fields:\n")
-
-    fields_to_check = (
-        "id",
-        "title",
-        "parentIds",
-        "superTaskIds",
-        "superParentIds",
-        "subTaskIds",
-    )
-
-    for field in fields_to_check:
-        if field in task:
-            print(f"{field}: PRESENT -> {task.get(field)}")
-        else:
-            print(f"{field}: ABSENT")
+    if now_gone:
+        out_path = "output/task_reconciliation/now_deleted_task_ids.csv"
+        with open(out_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["task_id"])
+            for task_id in sorted(now_gone):
+                writer.writerow([task_id])
+        print(f"\nWrote the now-gone IDs to {out_path}")
 
 
 if __name__ == "__main__":
