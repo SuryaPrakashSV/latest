@@ -1,13 +1,168 @@
-WITH holiday_rows AS (
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = 'MQAAAABnlKFK'
-),
-all_hierarchy_ids AS (
-    SELECT NULLIF(TRIM("parent_task_id"), '') AS task_id FROM holiday_rows
-    UNION ALL SELECT NULLIF(TRIM("child_task_id"), '') FROM holiday_rows
-    UNION ALL SELECT NULLIF(TRIM("grandchild_task_id"), '') FROM holiday_rows
-    UNION ALL SELECT NULLIF(TRIM("baby_task_id"), '') FROM holiday_rows
-    UNION ALL SELECT NULLIF(TRIM("grandbaby_task_id"), '') FROM holiday_rows
-    UNION ALL SELECT NULLIF(TRIM("great_grandbaby_task_id"), '') FROM holiday_rows
+"""Check whether the 123 tasks missing from Snowflake were created recently
+enough that normal 2-hour full-load latency (not a defect) could explain the
+gap, before doing a more expensive table-wide search across all of
+Wrike_STG.
+
+Pulls createdDate/updatedDate for all 123 and reports the distribution -
+if most were created within the last few hours, that's a timing/freshness
+explanation, not a bug. If most are old (days/weeks), timing doesn't
+explain it and the table-wide search becomes the necessary next step.
+
+Usage:
+    python3 check_creation_timing.py \
+        --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import getpass
+import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+API_BASE = "https://www.wrike.com/api/v4"
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def chunked(items, size):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def read_task_ids(csv_path: str) -> list[str]:
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        key = fieldnames.get("task_id")
+        if key is None:
+            raise SystemExit(f"No task_id column found in {csv_path}. Columns: {reader.fieldnames}")
+        return [row[key].strip() for row in reader if row.get(key, "").strip()]
+
+
+def get_with_backoff(url, headers, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--missing-csv", required=True)
+    args = parser.parse_args()
+
+    missing_ids = read_task_ids(args.missing_csv)
+    tok = token()
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    now = datetime.now(timezone.utc)
+    buckets = {
+        "< 2 hours old": 0,
+        "2-24 hours old": 0,
+        "1-7 days old": 0,
+        "> 7 days old": 0,
+        "unparseable": 0,
+    }
+    oldest = None
+    newest = None
+
+    for batch in chunked(missing_ids, 100):
+        ids_param = ",".join(batch)
+        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers)
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
+        resp.raise_for_status()
+
+        for task in resp.json()["data"]:
+            created_raw = task.get("createdDate")
+            if not created_raw:
+                buckets["unparseable"] += 1
+                continue
+            try:
+                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except ValueError:
+                buckets["unparseable"] += 1
+                continue
+
+            age = now - created
+            if oldest is None or created < oldest:
+                oldest = created
+            if newest is None or created > newest:
+                newest = created
+
+            if age.total_seconds() < 2 * 3600:
+                buckets["< 2 hours old"] += 1
+            elif age.total_seconds() < 24 * 3600:
+                buckets["2-24 hours old"] += 1
+            elif age.total_seconds() < 7 * 24 * 3600:
+                buckets["1-7 days old"] += 1
+            else:
+                buckets["> 7 days old"] += 1
+
+    total = len(missing_ids)
+    print(f"Missing tasks checked: {total}\n")
+    print("Age distribution (createdDate vs now):")
+    for label, count in buckets.items():
+        print(f"  {label}: {count} ({count / total:.0%})")
+
+    if oldest and newest:
+        print(f"\nOldest missing task created: {oldest.isoformat()}")
+        print(f"Newest missing task created: {newest.isoformat()}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+python3 check_creation_timing.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+
+
+
+
+WITH all_hierarchy AS (
+    SELECT "id" AS owning_id, "title" AS owning_title, NULLIF(TRIM("parent_task_id"), '') AS task_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    UNION ALL
+    SELECT "id", "title", NULLIF(TRIM("child_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    UNION ALL
+    SELECT "id", "title", NULLIF(TRIM("grandchild_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    UNION ALL
+    SELECT "id", "title", NULLIF(TRIM("baby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    UNION ALL
+    SELECT "id", "title", NULLIF(TRIM("grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    UNION ALL
+    SELECT "id", "title", NULLIF(TRIM("great_grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
 )
-SELECT DISTINCT task_id AS "task_id" FROM all_hierarchy_ids WHERE task_id IS NOT NULL ORDER BY "task_id";
+SELECT DISTINCT m.task_id, a.owning_id, a.owning_title
+FROM TEMP_MISSING_HOLIDAY_TASKS m
+LEFT JOIN all_hierarchy a ON a.task_id = m.task_id
+ORDER BY m.task_id;
