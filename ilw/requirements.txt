@@ -150,3 +150,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+python3 check_superparents.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv --home-project-id MQAAAAEIsSOV
