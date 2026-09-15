@@ -1,9 +1,245 @@
-SELECT
-    "id" AS project_id,
-    "title" AS project_name,
-    SUBSTR("id", 8, 1) AS ambiguous_char,
-    ASCII(SUBSTR("id", 8, 1)) AS ambiguous_char_code
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE COALESCE(TRY_TO_BOOLEAN("is_project"), FALSE) = TRUE
-  AND "title" ILIKE 'Holiday (FY27)%'
-GROUP BY "id", "title";
+"""Resolve whether the 123 tasks 'missing from Snowflake' for Holiday (FY27)
+are a real production extraction gap or an artifact of our own closure-walk
+crossing project boundaries.
+
+Four checks, per the open questions raised about the earlier conclusion:
+
+1. Folder-level ancestry: does folder MQAAAAE06vxh ('Specialist image
+   refresh Q1&Q2 FY27') have Holiday as an ancestor FOLDER (not task)?
+   Task-level parentIds/superParentIds are not documented as the complete
+   folder-ancestor chain, so this walks the actual folder hierarchy via
+   GET /folders/{id}.
+
+2. Was a known top-level 'missing' task (no superTaskIds, so it couldn't
+   have been found via the subTaskIds closure-walk) already present in the
+   RAW initial GET /folders/{HolidayId}/tasks?descendants=true response,
+   before any closure-walk expansion? If yes, Wrike's own official
+   descendants call is what pulled it in - not a closure-walk bug.
+
+3. An authoritative, properly-paginated pull of Holiday's own descendant
+   tasks straight from the folder endpoint (checking for nextPageToken,
+   since the original script never handled pagination and a 300+ task
+   project could plausibly be getting silently truncated).
+
+4. A three-way comparison: folder-endpoint set vs. subTaskIds-closure-walk
+   set vs. Snowflake's distinct task_id set for Holiday.
+
+This is entirely read-only - it only calls Wrike's API to inspect data, and
+never touches Snowflake or production.
+
+Usage:
+    python3 resolve_scope.py \
+        --project-id MQAAAAEIsSOV \
+        --other-folder-id MQAAAAE06vxh \
+        --known-top-level-task-id MAAAAAE06vyQ \
+        --snowflake-csv holiday_task_ids.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import getpass
+import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+API_BASE = "https://www.wrike.com/api/v4"
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def chunked(items, size):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def read_task_ids(csv_path: str) -> set[str]:
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        key = fieldnames.get("task_id")
+        if key is None:
+            raise SystemExit(f"No task_id column found in {csv_path}. Columns: {reader.fieldnames}")
+        return {row[key].strip() for row in reader if row.get(key, "").strip()}
+
+
+def get_with_backoff(url, headers, params=None, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
+
+
+def folder_ancestry(folder_id: str, headers: dict, max_depth: int = 20) -> list[str]:
+    """Walk UP the actual folder hierarchy (not task parentIds) via
+    GET /folders/{id}, returning the chain from folder_id up to its
+    top-level ancestor. Stops at max_depth as a safety cap against cycles.
+    """
+    chain = [folder_id]
+    current = folder_id
+    for _ in range(max_depth):
+        resp = get_with_backoff(f"{API_BASE}/folders/{current}", headers)
+        if not resp.ok:
+            print(f"  (could not fetch folder {current}: {resp.status_code} {resp.text})")
+            break
+        data = resp.json().get("data", [])
+        if not data:
+            break
+        parent_ids = data[0].get("parentIds") or []
+        if not parent_ids:
+            break
+        current = parent_ids[0]
+        if current in chain:
+            print(f"  (cycle detected at {current}, stopping)")
+            break
+        chain.append(current)
+    return chain
+
+
+def fetch_folder_tasks_page(folder_id: str, headers: dict, next_page_token: str | None):
+    params = {
+        "descendants": "true",
+        "subTasks": "true",
+        "fields": '["subTaskIds","superTaskIds"]',
+    }
+    if next_page_token:
+        params = {"nextPageToken": next_page_token}
+    return get_with_backoff(f"{API_BASE}/folders/{folder_id}/tasks", headers, params=params)
+
+
+def fetch_all_folder_tasks(folder_id: str, headers: dict) -> list[dict]:
+    """Authoritative pull straight from the folder endpoint, following
+    nextPageToken if Wrike returns one - the original scripts never
+    checked for pagination, so a large project could have been silently
+    truncated.
+    """
+    all_tasks: list[dict] = []
+    next_page_token = None
+    page = 1
+    while True:
+        resp = fetch_folder_tasks_page(folder_id, headers, next_page_token)
+        resp.raise_for_status()
+        payload = resp.json()
+        page_tasks = payload.get("data", [])
+        all_tasks.extend(page_tasks)
+        next_page_token = payload.get("nextPageToken")
+        print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(all_tasks)})")
+        if not next_page_token:
+            break
+        page += 1
+    return all_tasks
+
+
+def closure_walk(initial_tasks: list[dict], headers: dict) -> set[str]:
+    seen: set[str] = set()
+    frontier: set[str] = set()
+    for task in initial_tasks:
+        seen.add(task["id"])
+        frontier.update(task.get("subTaskIds") or [])
+    frontier -= seen
+
+    while frontier:
+        batch = list(frontier)[:100]
+        ids_param = ",".join(batch)
+        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers, params={"fields": '["subTaskIds"]'})
+        resp.raise_for_status()
+        for task in resp.json()["data"]:
+            seen.add(task["id"])
+            frontier.update(task.get("subTaskIds") or [])
+        frontier -= seen
+
+    return seen
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-id", required=True, help="Holiday's own project/folder ID")
+    parser.add_argument("--other-folder-id", required=True, help="MQAAAAE06vxh - the 'Specialist image refresh' folder")
+    parser.add_argument("--known-top-level-task-id", required=True)
+    parser.add_argument("--snowflake-csv", required=True)
+    args = parser.parse_args()
+
+    tok = token()
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    print("=" * 70)
+    print(f"1. Folder-level ancestry of {args.other_folder_id}")
+    print("=" * 70)
+    chain = folder_ancestry(args.other_folder_id, headers)
+    print(f"  Ancestor chain: {chain}")
+    if args.project_id in chain:
+        print(f"  -> Holiday ({args.project_id}) IS an ancestor folder. These ARE nested under Holiday.")
+    else:
+        print(f"  -> Holiday ({args.project_id}) is NOT in this folder's ancestor chain. Separate project confirmed at folder level.")
+
+    print()
+    print("=" * 70)
+    print(f"2. Authoritative, paginated pull of Holiday's own descendant tasks")
+    print("=" * 70)
+    initial_tasks = fetch_all_folder_tasks(args.project_id, headers)
+    initial_ids = {t["id"] for t in initial_tasks}
+    print(f"  Total tasks from folder endpoint (with pagination): {len(initial_ids)}")
+
+    in_initial = args.known_top_level_task_id in initial_ids
+    print(f"\n  Was {args.known_top_level_task_id} present in this RAW initial response? {in_initial}")
+    if in_initial:
+        print("  -> Wrike's own official descendants call pulled it in directly - not a closure-walk artifact.")
+    else:
+        print("  -> It was NOT in the raw folder response - must have entered via some other path (worth double-checking the original script's behavior).")
+
+    print()
+    print("=" * 70)
+    print("3. Full subTaskIds closure-walk (same method as reconcile_task_ids.py)")
+    print("=" * 70)
+    closure_ids = closure_walk(initial_tasks, headers)
+    print(f"  Closure-walk total: {len(closure_ids)}")
+
+    print()
+    print("=" * 70)
+    print("4. Three-way comparison")
+    print("=" * 70)
+    snowflake_ids = read_task_ids(args.snowflake_csv)
+    print(f"  Folder-endpoint (authoritative) IDs: {len(initial_ids)}")
+    print(f"  Closure-walk IDs:                    {len(closure_ids)}")
+    print(f"  Snowflake distinct task IDs:          {len(snowflake_ids)}")
+
+    print(f"\n  Folder-endpoint vs Snowflake:")
+    print(f"    Matched:                {len(initial_ids & snowflake_ids)}")
+    print(f"    Folder-only (missing SF): {len(initial_ids - snowflake_ids)}")
+    print(f"    Snowflake-only (orphans): {len(snowflake_ids - initial_ids)}")
+
+    print(f"\n  Closure-walk vs Folder-endpoint:")
+    print(f"    In closure-walk but NOT in folder-endpoint: {len(closure_ids - initial_ids)}")
+    print(f"    (this is the set that crossed project boundaries via subTaskIds, if any)")
+
+
+if __name__ == "__main__":
+    main()
+
+python3 resolve_scope.py --project-id MQAAAAEIsSOV --other-folder-id MQAAAAE06vxh --known-top-level-task-id MAAAAAE06vyQ --snowflake-csv holiday_task_ids.csv
