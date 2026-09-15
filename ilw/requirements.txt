@@ -126,5 +126,14 @@ def main() -> None:
         connection.close()
 
 
+export SNOWFLAKE_ACCOUNT="your_account"
+export SNOWFLAKE_USER="SPRAKASH7@APPLE.COM"
+export SNOWFLAKE_WAREHOUSE="your_warehouse"
+export SNOWFLAKE_ROLE="GBI_RETAIL_BAP_DB_ASO_OPS_WSA_SNDBX_BIZ_APP_MAIN_ROLE"
+export SNOWFLAKE_AUTHENTICATOR="externalbrowser"
+
+
+python3 table_wide_search.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+
 if __name__ == "__main__":
     main()
