@@ -1,17 +1,19 @@
-"""Quick one-task probe: which of these field names are valid EXPLICIT
-optional fields on GET /tasks/{id}?
+"""
+Quick one-task probe.
 
-We already have confirmed, literal proof that 'title' and 'superTaskIds'
-are REJECTED when requested explicitly on this endpoint (they come back by
-default instead) - see the two 400 errors already hit and fixed earlier in
-this project. Before building a full hierarchy diagnostic across all 316
-Holiday tasks using parentIds/superParentIds/subTaskIds, check each one
-individually against a single real task ID, so we don't repeat that same
-trial-and-error cycle at scale.
+Purpose:
+Make one plain GET /tasks/{id} request with NO explicit `fields` parameter
+and inspect which hierarchy-related fields Wrike returns by default.
 
 Usage:
     python3 probe_fields.py
-    (it will ask for a task ID interactively)
+
+The script will:
+1. Ask for the Wrike token using a hidden prompt if WRIKE_TOKEN is not set.
+2. Ask for one real task ID.
+3. Make one GET /tasks/{task_id} request.
+4. Print every key returned by Wrike.
+5. Specifically show whether the hierarchy fields we care about are present.
 """
 
 import getpass
@@ -24,30 +26,70 @@ API_BASE = "https://www.wrike.com/api/v4"
 
 def token() -> str:
     value = os.getenv("WRIKE_TOKEN", "").strip()
-    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+    if value:
+        return value
+
+    return getpass.getpass(
+        "Wrike token (hidden; not saved): "
+    ).strip()
 
 
 def main() -> None:
     tok = token()
-    headers = {"Authorization": f"Bearer {tok}"}
 
-    sample_task_id = input("Paste one real task ID to probe against: ").strip()
+    headers = {
+        "Authorization": f"Bearer {tok}"
+    }
 
-    candidate_fields = ["parentIds", "superParentIds", "subTaskIds", "superTaskIds", "title"]
+    task_id = input(
+        "Paste one real task ID to probe against: "
+    ).strip()
 
-    print(f"\nProbing {sample_task_id} field-by-field...\n")
-    for field in candidate_fields:
-        resp = requests.get(
-            f"{API_BASE}/tasks/{sample_task_id}",
-            headers=headers,
-            params={"fields": f'["{field}"]'},
-        )
-        if resp.ok:
-            data = resp.json()["data"][0]
-            present_keys = sorted(data.keys())
-            print(f"{field}: OK (accepted). Full response keys: {present_keys}")
+    if not task_id:
+        raise SystemExit("Task ID cannot be blank.")
+
+    print(f"\nFetching default response for task: {task_id}\n")
+
+    resp = requests.get(
+        f"{API_BASE}/tasks/{task_id}",
+        headers=headers,
+        timeout=30,
+    )
+
+    if not resp.ok:
+        print(f"Request failed: HTTP {resp.status_code}")
+        print(resp.text)
+        return
+
+    payload = resp.json()
+    data = payload.get("data", [])
+
+    if not data:
+        print("Request succeeded, but Wrike returned no task data.")
+        return
+
+    task = data[0]
+
+    print("All keys in the default response:")
+    print(sorted(task.keys()))
+
+    print("\nHierarchy / task fields:\n")
+
+    fields_to_check = (
+        "id",
+        "title",
+        "parentIds",
+        "superTaskIds",
+        "superParentIds",
+        "subTaskIds",
+    )
+
+    for field in fields_to_check:
+        if field in task:
+            print(f"{field}: PRESENT -> {task.get(field)}")
         else:
-            print(f"{field}: REJECTED - {resp.text}")
+            print(f"{field}: ABSENT")
 
 
 if __name__ == "__main__":
