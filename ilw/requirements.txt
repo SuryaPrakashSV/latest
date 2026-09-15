@@ -1,1 +1,152 @@
-python3 recheck_existence.py --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv
+"""For all tasks missing from Snowflake, pull parentIds/superTaskIds/
+superParentIds in bulk and tally how their superParentIds values cluster.
+
+One sampled task (MAAAAAE06wA2) already showed superParentIds pointing to
+MQAAAAE06vxh - a DIFFERENT project than Holiday (FY27, MQAAAAEIsSOV) - even
+though it was reachable via Holiday's own closure-walk. This checks whether
+that's a one-off or whether most/all of the 123 missing tasks share that
+same (or some other single) non-Holiday superParentIds value, which would
+mean the reconciliation gap is largely explained by tasks whose true project
+home differs from Holiday, not a hierarchy-walk depth bug.
+
+Usage:
+    python3 check_superparents.py \
+        --missing-csv output/task_reconciliation/MQAAAAEIsSOV_api_only_missing_from_snowflake.csv \
+        --home-project-id MQAAAAEIsSOV
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import getpass
+import os
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+API_BASE = "https://www.wrike.com/api/v4"
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def chunked(items, size):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def read_task_ids(csv_path: str) -> list[str]:
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        key = fieldnames.get("task_id")
+        if key is None:
+            raise SystemExit(f"No task_id column found in {csv_path}. Columns: {reader.fieldnames}")
+        return [row[key].strip() for row in reader if row.get(key, "").strip()]
+
+
+def get_with_backoff(url, headers, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--missing-csv", required=True)
+    parser.add_argument("--home-project-id", required=True, help="The project ID these tasks were pulled FROM (e.g. Holiday's own ID)")
+    args = parser.parse_args()
+
+    missing_ids = read_task_ids(args.missing_csv)
+    tok = token()
+    headers = {"Authorization": f"Bearer {tok}"}
+
+    super_parent_counter: Counter[tuple[str, ...]] = Counter()
+    not_home_examples: list[dict] = []
+    checked = 0
+    not_found = 0
+
+    for batch in chunked(missing_ids, 100):
+        ids_param = ",".join(batch)
+        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers)
+        if resp.status_code == 404:
+            for task_id in batch:
+                single = get_with_backoff(f"{API_BASE}/tasks/{task_id}", headers)
+                if not single.ok:
+                    not_found += 1
+                    continue
+                task = single.json()["data"][0]
+                checked += 1
+                supers = tuple(sorted(task.get("superParentIds") or []))
+                super_parent_counter[supers] += 1
+                if args.home_project_id not in supers and len(not_home_examples) < 10:
+                    not_home_examples.append(
+                        {
+                            "id": task["id"],
+                            "title": task.get("title"),
+                            "parentIds": task.get("parentIds"),
+                            "superParentIds": task.get("superParentIds"),
+                        }
+                    )
+            continue
+
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
+        resp.raise_for_status()
+
+        for task in resp.json()["data"]:
+            checked += 1
+            supers = tuple(sorted(task.get("superParentIds") or []))
+            super_parent_counter[supers] += 1
+            if args.home_project_id not in supers and len(not_home_examples) < 10:
+                not_home_examples.append(
+                    {
+                        "id": task["id"],
+                        "title": task.get("title"),
+                        "parentIds": task.get("parentIds"),
+                        "superParentIds": task.get("superParentIds"),
+                    }
+                )
+
+    print(f"Missing tasks in input CSV: {len(missing_ids)}")
+    print(f"Successfully checked:       {checked}")
+    print(f"Not found even individually: {not_found}")
+    print(f"\nsuperParentIds distribution (how many tasks share each set of top-level ancestor(s)):")
+    for supers, count in super_parent_counter.most_common():
+        flag = "" if args.home_project_id in supers else "  <-- does NOT include home project"
+        print(f"  {count:4d} task(s): {list(supers)}{flag}")
+
+    if not_home_examples:
+        print(f"\nSample tasks whose superParentIds do NOT include {args.home_project_id}:")
+        for ex in not_home_examples:
+            print(f"  - {ex['id']} | {ex['title']} | parentIds={ex['parentIds']} | superParentIds={ex['superParentIds']}")
+
+
+if __name__ == "__main__":
+    main()
