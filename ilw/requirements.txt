@@ -1,9 +1,9 @@
 WITH task_rows AS (
     SELECT
-        status,
-        customStatusId,
-        updatedDate,
-        completedDate
+        "status" AS task_status,
+        "customStatusId" AS custom_status,
+        "updatedDate" AS updated_date,
+        "completedDate" AS completed_date
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE parent_task_id = 'IEADQP2VKRD2ARI6'
        OR child_task_id = 'IEADQP2VKRD2ARI6'
@@ -14,26 +14,26 @@ WITH task_rows AS (
 ),
 stored_statuses AS (
     SELECT
-        status,
-        customStatusId,
-        updatedDate,
-        completedDate,
+        task_status,
+        custom_status,
+        updated_date,
+        completed_date,
         COUNT(*) AS physical_row_count
     FROM task_rows
     GROUP BY
-        status,
-        customStatusId,
-        updatedDate,
-        completedDate
+        task_status,
+        custom_status,
+        updated_date,
+        completed_date
 )
 SELECT
     ROW_NUMBER() OVER (
-        ORDER BY updatedDate
+        ORDER BY updated_date
     ) AS recorded_sequence,
-    status,
-    customStatusId,
-    updatedDate,
-    completedDate,
+    task_status,
+    custom_status,
+    updated_date,
+    completed_date,
     physical_row_count
 FROM stored_statuses
 ORDER BY recorded_sequence;
