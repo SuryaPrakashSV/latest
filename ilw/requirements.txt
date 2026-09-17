@@ -1,1 +1,2 @@
 python3 task_history_probe.py --task-id IEADQP2VKRD2ARI6 --task-id IEADQP2VKRD2ARJD --task-id IEADQP2VKRD2NCRG --task-id IEADQP2VKRD3J35Z --task-id IEADQP2VKRD3J37H --task-id IEADQP2VKRD3J37N
+find ~/Desktop/wrike_incremental_load -maxdepth 3 -type f -name "*.py" -print
