@@ -1,639 +1,112 @@
-"""Read-only Wrike probe for completed task/subtask status history.
+"""Check access to Wrike's documented historical-status export source.
 
-This script answers one narrow question: for selected completed task IDs, does
-Wrike return historical status-change records, or only current task state?
-
-It performs GET requests only:
-  * GET /tasks/{taskIds}
-  * GET /tasks/{taskIds}/tasks_history
-  * GET /workflows
-
-It never prints or saves the authorization token or request headers.
+GET /data_export only. Does not refresh exports, download CSVs, or modify Wrike.
+The saved response redacts the token and URLs (export links can grant access).
+This is an access check, not proof that any selected task has history.
+Docs: https://developers.wrike.com/docs/schema-reference-bi-export
 """
-
-from __future__ import annotations
-
 import argparse
-import csv
 import getpass
 import json
-import os
 import re
-import time
-from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
-PROBE_VERSION = "1.2-current-status-display"
-HISTORY_DOC = "https://developers.wrike.com/reference/gettasksmultitasks_history"
-
-API_BASE = "https://www.wrike.com/api/v4"
-TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_:\-.=]{1,256}$")
-STATUS_FIELD_MARKERS = {"field", "fieldname", "field_name", "property", "key", "name"}
-TIMESTAMP_KEYS = {
-    "date",
-    "timestamp",
-    "createddate",
-    "updateddate",
-    "changedat",
-    "changed_at",
-    "eventdate",
-    "event_date",
-}
-OLD_NEW_KEYS = {
-    "oldvalue",
-    "old_value",
-    "newvalue",
-    "new_value",
-    "previousvalue",
-    "previous_value",
-}
-EXPLICIT_STATUS_KEYS = {
-    "status",
-    "statusid",
-    "status_id",
-    "customstatusid",
-    "custom_status_id",
-    "oldstatus",
-    "old_status",
-    "newstatus",
-    "new_status",
-    "previousstatus",
-    "previous_status",
-    "statushistory",
-    "status_history",
-}
-
-
-@dataclass
-class ProbeResponse:
-    endpoint: str
-    status_code: int | None
-    ok: bool
-    payload: Any
-    error: str | None = None
-
-
-def utc_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-
-def validate_task_id(raw_value: str) -> str:
-    """Validate without normalizing, lowercasing, or otherwise changing an ID."""
-    if not isinstance(raw_value, str):
-        raise ValueError("Task ID must be text.")
-    if raw_value != raw_value.strip():
-        raise ValueError(
-            f"Task ID contains leading/trailing whitespace: {raw_value!r}. "
-            "Copy the exact ID again; the probe will not normalize it."
-        )
-    if not TASK_ID_PATTERN.fullmatch(raw_value):
-        raise ValueError(f"Task ID contains unexpected characters: {raw_value!r}")
-    return raw_value
-
-
-def dedupe_preserving_order(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        task_id = validate_task_id(value)
-        if task_id not in seen:
-            seen.add(task_id)
-            result.append(task_id)
-    return result
-
-
-def task_ids_from_csv(path: Path) -> list[str]:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            raise ValueError(f"CSV has no header row: {path}")
-        task_id_column = next(
-            (name for name in reader.fieldnames if name.lower() == "task_id"),
-            None,
-        )
-        if task_id_column is None:
-            raise ValueError(
-                f"CSV must contain a TASK_ID or task_id column. Found: {reader.fieldnames}"
-            )
-        values = [row[task_id_column] for row in reader if row.get(task_id_column)]
-    return dedupe_preserving_order(values)
-
-
-def get_token() -> str:
-    env_value = os.getenv("WRIKE_TOKEN")
-    if env_value:
-        if env_value != env_value.strip():
-            raise SystemExit("WRIKE_TOKEN has leading/trailing whitespace; fix it before running.")
-        return env_value
-    value = getpass.getpass("Wrike token (hidden; never saved): ")
-    if not value:
-        raise SystemExit("No Wrike token supplied.")
-    if value != value.strip():
-        raise SystemExit("The pasted token has leading/trailing whitespace; run again.")
-    return value
-
-
-def retry_delay(headers: Mapping[str, str], attempt: int) -> float:
-    retry_after = headers.get("Retry-After")
-    if retry_after:
-        try:
-            return max(0.0, float(retry_after))
-        except ValueError:
-            try:
-                retry_dt = parsedate_to_datetime(retry_after)
-                if retry_dt.tzinfo is None:
-                    retry_dt = retry_dt.replace(tzinfo=timezone.utc)
-                return max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError):
-                pass
-    return min(120.0, 5.0 * (2**attempt))
+ENDPOINT = "https://www.wrike.com/api/v4/data_export"
+TARGET = "work_workflow_stage_history"
 
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # Do not forward credentials to a redirected destination.
+        return None
 
 
-def get_json(
-    headers: Mapping[str, str],
-    endpoint: str,
-    *,
-    params: dict[str, str] | None = None,
-    max_retries: int = 6,
-    timeout: int = 60,
-) -> ProbeResponse:
-    url = f"{API_BASE}{endpoint}"
-    if params:
-        url = f"{url}?{urlencode(params)}"
-
-    def decode_payload(body: bytes) -> Any:
-        try:
-            return json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {"non_json_body_omitted": True}
-
-    for attempt in range(max_retries):
-        request = Request(url, headers=dict(headers), method="GET")
-        try:
-            with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
-                status_code = response.status
-                payload = decode_payload(response.read())
-            return ProbeResponse(
-                endpoint=endpoint,
-                status_code=status_code,
-                ok=200 <= status_code < 300,
-                payload=payload,
-                error=None if 200 <= status_code < 300 else f"HTTP {status_code}",
-            )
-        except HTTPError as exc:
-            status_code = exc.code
-            payload = decode_payload(exc.read())
-            if status_code == 429 and attempt < max_retries - 1:
-                delay = retry_delay(exc.headers, attempt)
-                print(
-                    f"Rate limited. Waiting {delay:.0f}s before retry "
-                    f"{attempt + 1}/{max_retries}..."
-                )
-                time.sleep(delay)
-                continue
-            return ProbeResponse(
-                endpoint=endpoint,
-                status_code=status_code,
-                ok=False,
-                payload=payload,
-                error=f"HTTP {status_code}",
-            )
-        except (URLError, TimeoutError, OSError) as exc:
-            return ProbeResponse(
-                endpoint=endpoint,
-                status_code=None,
-                ok=False,
-                payload=None,
-                error=type(exc).__name__,
-            )
-
-    # Defensive fallback; each loop path above returns or retries.
-    return ProbeResponse(
-        endpoint=endpoint,
-        status_code=None,
-        ok=False,
-        payload=None,
-        error="Request retry loop ended unexpectedly.",
-    )
-
-
-def response_data(response: ProbeResponse) -> list[dict[str, Any]]:
-    if not response.ok or not isinstance(response.payload, dict):
-        return []
-    data = response.payload.get("data")
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
-
-
-def build_status_name_map(workflows_response: ProbeResponse) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    for workflow in response_data(workflows_response):
-        statuses = workflow.get("customStatuses") or []
-        if not isinstance(statuses, list):
-            continue
-        for status in statuses:
-            if not isinstance(status, dict):
-                continue
-            status_id = status.get("id")
-            status_name = status.get("name")
-            if isinstance(status_id, str) and isinstance(status_name, str):
-                mapping[status_id] = status_name
-    return mapping
-
-
-def _direct_status_signal(node: dict[str, Any]) -> bool:
-    for key in node:
-        if str(key).lower() in EXPLICIT_STATUS_KEYS:
-            return True
-    for key, value in node.items():
-        if str(key).lower() in STATUS_FIELD_MARKERS and "status" in str(value).lower():
-            return True
-    return False
-
-
-def _record_has_timestamp(record: dict[str, Any]) -> bool:
-    return any(str(key).lower() in TIMESTAMP_KEYS for key in record)
-
-
-def _record_has_old_new_value(record: dict[str, Any]) -> bool:
-    return any(str(key).lower() in OLD_NEW_KEYS for key in record)
-
-
-def find_status_records(payload: Any, requested_task_ids: set[str]) -> list[dict[str, Any]]:
-    """Locate status-shaped history records without assuming one response schema."""
-    matches: list[dict[str, Any]] = []
-
-    def walk(
-        node: Any,
-        path: str,
-        task_context: str | None,
-        status_context: bool,
-    ) -> None:
-        if isinstance(node, dict):
-            next_context = task_context
-            for key in ("taskId", "task_id", "id"):
-                candidate = node.get(key)
-                if isinstance(candidate, str) and candidate in requested_task_ids:
-                    next_context = candidate
-                    break
-
-            direct_status_signal = _direct_status_signal(node)
-            next_status_context = status_context or direct_status_signal
-            if direct_status_signal or (
-                status_context
-                and (_record_has_timestamp(node) or _record_has_old_new_value(node))
-            ):
-                matches.append(
-                    {
-                        "task_id": next_context,
-                        "json_path": path,
-                        "has_timestamp": _record_has_timestamp(node),
-                        "has_old_or_new_value": _record_has_old_new_value(node),
-                        "record": node,
-                    }
-                )
-
-            for key, value in node.items():
-                walk(value, f"{path}.{key}", next_context, next_status_context)
-        elif isinstance(node, list):
-            for index, value in enumerate(node):
-                walk(value, f"{path}[{index}]", task_context, status_context)
-
-    walk(payload, "$", None, False)
-    return matches
-
-
-def classify_history_result(response: ProbeResponse, matches: list[dict[str, Any]]) -> str:
-    if response.status_code in {401, 403}:
-        return "PERMISSION_BLOCKED"
-    if not response.ok:
-        return "REQUEST_FAILED"
-    ordered_candidates = sum(
-        1 for match in matches if match["has_timestamp"] and match["has_old_or_new_value"]
-    )
-    if ordered_candidates:
-        return "ORDERED_STATUS_TRANSITION_CANDIDATES_FOUND_REVIEW_REQUIRED"
-    if matches:
-        return "STATUS_SHAPED_RECORDS_FOUND_BUT_ORDERED_TRANSITIONS_NOT_PROVEN"
-    if not isinstance(response.payload, dict) or not isinstance(response.payload.get("data"), list):
-        return "UNEXPECTED_RESPONSE_SHAPE_REVIEW_REQUIRED"
-    return "NO_STATUS_RECORDS_IN_SUCCESSFUL_HISTORY_RESPONSE"
-
-
-def audit_response(response: ProbeResponse, task_ids: list[str], kind: str) -> dict[str, Any]:
-    payload = response.payload
-    data = payload.get("data") if isinstance(payload, dict) else None
-    records = data if isinstance(data, list) else []
-    ids = [row.get("id") for row in records if isinstance(row, dict)
-           and isinstance(row.get("id"), str)]
-    returned = set(ids)
-    expected = set(task_ids)
-    valid = (response.ok and isinstance(payload, dict)
-             and payload.get("kind") == kind and isinstance(data, list)
-             and all(isinstance(row, dict) and isinstance(row.get("id"), str)
-                     for row in records))
-    return {
-        "expected_kind": kind,
-        "actual_kind": payload.get("kind") if isinstance(payload, dict) else None,
-        "response_shape_valid": valid,
-        "returned_record_count": len(records),
-        "unique_ids_returned": len(returned),
-        "missing_requested_ids": [x for x in task_ids if x not in returned],
-        "unexpected_ids": sorted(returned - expected),
-        "duplicate_ids": sorted(x for x in returned if ids.count(x) > 1),
-        "exact_id_coverage": valid and returned == expected and len(ids) == len(returned),
-        "id_only_record_count": sum(isinstance(row, dict) and set(row) == {"id"}
-                                    for row in records),
-        "record_fields": [sorted(row) if isinstance(row, dict) else ["INVALID_RECORD"]
-                          for row in records],
-        "pagination_present": bool(isinstance(payload, dict) and
-                                   (payload.get("nextPageToken") or payload.get("nextPage"))),
-    }
-
-
-def redact(value: Any, token: str) -> Any:
+def sanitize(value, token):
     if isinstance(value, dict):
-        return {k: ("[REDACTED]" if k.lower() in
-                    {"authorization", "token", "accesstoken", "access_token", "password",
-                     "cookie", "set-cookie", "refresh_token", "private_key"}
-                    else redact(v, token)) for k, v in value.items()}
+        return {str(k).replace(token, "[REDACTED]"): sanitize(v, token)
+                for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(v, token) for v in value]
+        return [sanitize(v, token) for v in value]
     if isinstance(value, str):
-        return value.replace(token, "[REDACTED]") if token else value
+        value = value.replace(token, "[REDACTED]")
+        return re.sub(r"https?://[^\s\"<>]+", "[URL REDACTED]", value)
     return value
 
 
-def write_json(path: Path, value: Any) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, ensure_ascii=False, default=str)
-        handle.write("\n")
+def interpret(code, payload):
+    if code == 403:
+        return "EXPORT_ACCESS_DENIED", "This request is forbidden. Historical rows were not retrieved."
+    if code == 401:
+        return "AUTHENTICATION_FAILED", "Token was not accepted; this does not establish export permissions."
+    if code == 429:
+        return "RATE_LIMITED", "Access is inconclusive. Retry later according to Retry-After."
+    if code is None:
+        return "NETWORK_FAILED", "No HTTP response; access is inconclusive."
+    if code != 200:
+        return "REQUEST_NOT_SUCCESSFUL", "Inspect the saved error; this is not evidence of absent history."
+    if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("data"), list):
+        return "RESPONSE_NEEDS_REVIEW", "HTTP 200 alone does not establish a usable export."
+    if not payload["data"]:
+        return "NO_EXPORT_RETURNED", "No export was returned; historical availability is unresolved."
+    return "EXPORT_RESPONSE_AVAILABLE_REVIEW_REQUIRED", "Next inspect export resources, then match the selected task and its history."
 
 
-def write_summary_csv(
-    path: Path,
-    task_ids: list[str],
-    current_response: ProbeResponse,
-    status_names: dict[str, str],
-    status_matches: list[dict[str, Any]],
-) -> None:
-    current_by_id = {
-        item["id"]: item
-        for item in response_data(current_response)
-        if isinstance(item.get("id"), str)
-    }
-    match_counts: dict[str | None, int] = {}
-    ordered_candidate_counts: dict[str | None, int] = {}
-    for match in status_matches:
-        task_id = match.get("task_id")
-        match_counts[task_id] = match_counts.get(task_id, 0) + 1
-        if match.get("has_timestamp") and match.get("has_old_or_new_value"):
-            ordered_candidate_counts[task_id] = ordered_candidate_counts.get(task_id, 0) + 1
-
-    fieldnames = [
-        "task_id",
-        "current_task_found",
-        "title",
-        "permalink",
-        "current_general_status",
-        "current_custom_status_id",
-        "current_custom_status_name",
-        "current_updated_date",
-        "current_completed_date",
-        "history_status_shaped_record_count",
-        "ordered_transition_candidate_count",
-    ]
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for task_id in task_ids:
-            task = current_by_id.get(task_id, {})
-            custom_status_id = task.get("customStatusId")
-            writer.writerow(
-                {
-                    "task_id": task_id,
-                    "current_task_found": bool(task),
-                    "title": task.get("title"),
-                    "permalink": task.get("permalink"),
-                    "current_general_status": task.get("status"),
-                    "current_custom_status_id": custom_status_id,
-                    "current_custom_status_name": status_names.get(custom_status_id, ""),
-                    "current_updated_date": task.get("updatedDate"),
-                    "current_completed_date": task.get("completedDate"),
-                    "history_status_shaped_record_count": match_counts.get(task_id, 0),
-                    "ordered_transition_candidate_count": ordered_candidate_counts.get(task_id, 0),
-                }
-            )
-
-
-def print_saved_report(output_dir: Path) -> None:
-    """Display saved evidence only; do not fetch data or infer missing values."""
-    with (output_dir / "probe_summary.json").open(encoding="utf-8") as handle:
-        summary = json.load(handle)
-    with (output_dir / "task_status_probe_summary.csv").open(
-        encoding="utf-8-sig", newline=""
-    ) as handle:
-        rows = list(csv.DictReader(handle))
-
-    print(f"Evidence run started (UTC): {summary.get('run_started_utc', 'Not recorded')}")
-    print("CURRENT TASK DATA AT THAT RUN")
-    print("completedDate is a current task field, not a reconstructed transition timeline.")
-    for row in rows:
-        print()
-        print(f"Task ID: {row.get('task_id') or 'Not recorded'}")
-        if str(row.get("current_task_found", "")).lower() != "true":
-            print("Current task: Not returned; status and dates unavailable.")
-        else:
-            for label, field in (
-                ("Title", "title"),
-                ("Current general status", "current_general_status"),
-                ("Current custom status name", "current_custom_status_name"),
-                ("Current custom status ID", "current_custom_status_id"),
-                ("Completed date (API completedDate)", "current_completed_date"),
-                ("Last updated (API updatedDate)", "current_updated_date"),
-            ):
-                value = row.get(field)
-                missing = "Unresolved" if field == "current_custom_status_name" else "Not returned"
-                print(f"{label}: {value if value else missing}")
-        print(f"History status-shaped records: {row.get('history_status_shaped_record_count', 'Not recorded')}")
-        print(f"Ordered transition candidates: {row.get('ordered_transition_candidate_count', 'Not recorded')}")
-
-    print()
-    print("HISTORY REQUEST RESULT")
-    print(f"Current task endpoint HTTP status: {summary.get('current_tasks_http_status')}")
-    print(f"Task-history endpoint HTTP status: {summary.get('task_history_http_status')}")
-    print(f"Status-shaped history records: {summary.get('status_shaped_history_records')}")
-    print(f"Ordered transition candidates: {summary.get('ordered_transition_candidates')}")
-    history_audit = summary.get("history_response_audit", {})
-    print(f"History ID-only records: {history_audit.get('id_only_record_count', 'Not recorded')}")
-    print(f"History exact task-ID coverage: {history_audit.get('exact_id_coverage', 'Not recorded')}")
-    print(f"Classification: {summary.get('classification')}")
-    print("Timestamps are displayed exactly as returned; Z means UTC.")
-    print("updatedDate is not necessarily the time of a status change.")
-    print(f"Evidence folder: {output_dir.resolve()}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Read-only probe of current task state and task field-history responses."
-    )
-    parser.add_argument(
-        "--task-id",
-        action="append",
-        default=[],
-        help="Exact case-sensitive Wrike task ID. Repeat for multiple IDs.",
-    )
-    parser.add_argument(
-        "--task-csv",
-        type=Path,
-        help="CSV exported from the supplied Snowflake query; must contain TASK_ID.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        help="Output directory. Default: output/task_status_history_probe/<UTC timestamp>.",
-    )
-    parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument(
-        "--show-saved",
-        type=Path,
-        help="Display a saved probe output folder without API requests or a token.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    run_started_utc = datetime.now(timezone.utc).isoformat()
-    args = parse_args()
-    if args.show_saved is not None:
-        if args.task_id or args.task_csv or args.output_dir:
-            raise SystemExit("Use --show-saved on its own, without task or output arguments.")
-        print("Displaying saved evidence only; no API requests or external writes.")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args()
+    token = getpass.getpass("Wrike token (hidden; not saved): ")
+    if not token or token != token.strip() or any(c.isspace() for c in token):
+        raise SystemExit("Token is blank or contains whitespace. Run again with the token only.")
+    print("Read-only check: GET /data_export")
+    print("This checks export access, not the selected task's historical rows.")
+    started = datetime.now(timezone.utc)
+    req = Request(ENDPOINT, headers={"Authorization": "Bearer " + token,
+                                   "Accept": "application/json"}, method="GET")
+    code, payload, retry_after = None, None, None
+    try:
         try:
-            print_saved_report(args.show_saved)
-        except (OSError, ValueError, csv.Error) as exc:
-            raise SystemExit(f"Unable to read saved evidence: {exc}") from exc
-        return
-    if args.timeout <= 0:
-        raise SystemExit("--timeout must be greater than zero.")
-    supplied_ids = list(args.task_id)
-    if args.task_csv:
-        supplied_ids.extend(task_ids_from_csv(args.task_csv))
-    task_ids = dedupe_preserving_order(supplied_ids)
-    if not task_ids:
-        raise SystemExit("Supply at least one --task-id or --task-csv.")
-    if len(task_ids) > 1000:
-        raise SystemExit("Wrike task-history endpoint accepts at most 1000 task IDs per request.")
-
-    output_dir = args.output_dir or Path("output") / "task_status_history_probe" / utc_stamp()
-    output_dir.mkdir(parents=True, exist_ok=False)
-
-    token = get_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": "wrike-task-status-history-read-only-probe/1.0",
-    }
-
-    ids_path = ",".join(task_ids)
-    print(f"Checking {len(task_ids)} exact task ID(s); no external writes will be made.")
-    print("History endpoint status-timeline support is not established by its name or HTTP 200.")
-    request_log: list[dict[str, Any]] = []
-
-    def fetch(endpoint: str, filename: str, params=None) -> ProbeResponse:
-        started = datetime.now(timezone.utc).isoformat()
-        response = get_json(headers, endpoint, params=params, timeout=args.timeout)
-        response.payload = redact(response.payload, token)
-        metadata = {
-            "method": "GET", "api_base": API_BASE, "endpoint": endpoint,
-            "query_parameters": params or {}, "started_utc": started,
-            "finished_utc": datetime.now(timezone.utc).isoformat(),
-            "status_code": response.status_code,
-        }
-        write_json(output_dir / filename, {**asdict(response), "request": metadata})
-        request_log.append(metadata)
-        write_json(output_dir / "request_manifest.json", request_log)
-        return response
-
-    current_response = fetch(f"/tasks/{ids_path}", "current_tasks_response.json")
-    history_response = fetch(f"/tasks/{ids_path}/tasks_history", "task_history_response.json")
-    workflows_response = fetch("/workflows", "workflows_response.json",
-                               {"includeSpaceWorkflow": "true"})
-    current_audit = audit_response(current_response, task_ids, "tasks")
-    history_audit = audit_response(history_response, task_ids, "tasksHistory")
-    write_json(output_dir / "response_audit.json",
-               {"current": current_audit, "history": history_audit})
-
-    status_names = build_status_name_map(workflows_response)
-    status_matches = (find_status_records(history_response.payload, set(task_ids))
-                      if history_audit["response_shape_valid"] else [])
-    classification = classify_history_result(history_response, status_matches)
-    if history_response.ok:
-        if not history_audit["response_shape_valid"]:
-            classification = "UNEXPECTED_RESPONSE_SHAPE_REVIEW_REQUIRED"
-        elif not history_audit["exact_id_coverage"] or history_audit["pagination_present"]:
-            classification = "INCOMPLETE_OR_AMBIGUOUS_HISTORY_RESPONSE"
-        elif history_audit["id_only_record_count"] == len(task_ids):
-            classification = "ID_ONLY_HISTORY_RESPONSE_NO_STATUS_RECORDS"
-    ordered_candidate_count = sum(
-        1
-        for match in status_matches
-        if match["has_timestamp"] and match["has_old_or_new_value"]
-    )
-
-    write_json(output_dir / "workflow_status_names.json", status_names)
-    write_json(output_dir / "status_history_matches.json", status_matches)
-    write_summary_csv(
-        output_dir / "task_status_probe_summary.csv",
-        task_ids,
-        current_response,
-        status_names,
-        status_matches,
-    )
-
-    summary = {
-        "probe_version": PROBE_VERSION,
-        "history_documentation": HISTORY_DOC,
-        "documented_optional_history_fields": ["plannedCost", "plannedFees", "actualFees", "actualCost"],
-        "history_request_parameters": {},
-        "scope_limit": "No documented status field selector was identified; this request is not proof that all Wrike history sources lack status events.",
-        "current_response_audit": current_audit,
-        "history_response_audit": history_audit,
-        "workflows_http_status": workflows_response.status_code,
-        "run_started_utc": run_started_utc,
-        "task_ids_requested": task_ids,
-        "task_count_requested": len(task_ids),
-        "current_tasks_http_status": current_response.status_code,
-        "current_tasks_returned": len(response_data(current_response)),
-        "task_history_http_status": history_response.status_code,
-        "task_history_request_ok": history_response.ok,
-        "status_shaped_history_records": len(status_matches),
-        "ordered_transition_candidates": ordered_candidate_count,
-        "unattributed_status_shaped_records": sum(
-            1 for match in status_matches if match.get("task_id") is None
-        ),
-        "classification": classification,
-        "interpretation": (
-            "Current task fields are not history. Treat a history record as a proven transition "
-            "only after confirming its task ID, status field, old/new value, and event timestamp. "
-            "Heuristic matches are JSON nodes, not unique events; candidate counts are not a proven timeline."
-        ),
-    }
-    write_json(output_dir / "probe_summary.json", summary)
-
-    print_saved_report(output_dir)
-    print(f"Evidence written to: {output_dir.resolve()}")
+            response = build_opener(NoRedirect()).open(req, timeout=45)
+        except HTTPError as exc:
+            response = exc
+        with response:
+            code = response.code
+            retry_after = response.headers.get("Retry-After")
+            raw = response.read(5_000_001)
+        if len(raw) > 5_000_000:
+            payload = {"error": "Response exceeded access-check size limit"}
+        else:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeError):
+                payload = {"error": "Non-JSON response; body omitted"}
+    except (URLError, TimeoutError, OSError) as exc:
+        payload = {"error": "Network failure", "detail": str(exc)}
+    payload = sanitize(payload, token)
+    classification, explanation = interpret(code, payload)
+    output = args.output_dir or Path("output") / "bi_history_access_probe" / started.strftime("%Y%m%dT%H%M%S%fZ")
+    output.mkdir(parents=True, exist_ok=False)
+    report = {"started_utc": started.isoformat(), "method": "GET", "endpoint": ENDPOINT,
+              "http_status": code, "retry_after": sanitize(retry_after, token),
+              "classification": classification, "explanation": explanation,
+              "target_history_table": TARGET, "historical_rows_retrieved": False,
+              "payload_redacted": payload}
+    target = output / "bi_history_access_result.json"
+    target.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    print("HTTP status:", code)
+    print("Classification:", classification)
+    print(explanation)
+    if code != 200 and isinstance(payload, dict):
+        for field in ("error", "errorDescription", "detail"):
+            if field in payload:
+                print(field + ":", json.dumps(payload[field], ensure_ascii=True))
+    if retry_after:
+        print("Retry-After:", json.dumps(sanitize(retry_after, token)))
+    print("Historical task-status rows retrieved: No (access check only)")
+    print("Saved evidence:", target.resolve())
 
 
 if __name__ == "__main__":
