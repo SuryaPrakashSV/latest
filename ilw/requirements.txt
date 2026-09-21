@@ -1,113 +1,24 @@
-"""Check access to Wrike's documented historical-status export source.
-
-GET /data_export only. Does not refresh exports, download CSVs, or modify Wrike.
-The saved response redacts the token and URLs (export links can grant access).
-This is an access check, not proof that any selected task has history.
-Docs: https://developers.wrike.com/docs/schema-reference-bi-export
-"""
-import argparse
-import getpass
-import json
-import re
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
-
-
-ENDPOINT = "https://www.wrike.com/api/v4/data_export"
-TARGET = "work_workflow_stage_history"
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def sanitize(value, token):
-    if isinstance(value, dict):
-        return {str(k).replace(token, "[REDACTED]"): sanitize(v, token)
-                for k, v in value.items()}
-    if isinstance(value, list):
-        return [sanitize(v, token) for v in value]
-    if isinstance(value, str):
-        value = value.replace(token, "[REDACTED]")
-        return re.sub(r"https?://[^\s\"<>]+", "[URL REDACTED]", value)
-    return value
-
-
-def interpret(code, payload):
-    if code == 403:
-        return "EXPORT_ACCESS_DENIED", "This request is forbidden. Historical rows were not retrieved."
-    if code == 401:
-        return "AUTHENTICATION_FAILED", "Token was not accepted; this does not establish export permissions."
-    if code == 429:
-        return "RATE_LIMITED", "Access is inconclusive. Retry later according to Retry-After."
-    if code is None:
-        return "NETWORK_FAILED", "No HTTP response; access is inconclusive."
-    if code != 200:
-        return "REQUEST_NOT_SUCCESSFUL", "Inspect the saved error; this is not evidence of absent history."
-    if not isinstance(payload, dict) or payload.get("error") or not isinstance(payload.get("data"), list):
-        return "RESPONSE_NEEDS_REVIEW", "HTTP 200 alone does not establish a usable export."
-    if not payload["data"]:
-        return "NO_EXPORT_RETURNED", "No export was returned; historical availability is unresolved."
-    return "EXPORT_RESPONSE_AVAILABLE_REVIEW_REQUIRED", "Next inspect export resources, then match the selected task and its history."
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path)
-    args = parser.parse_args()
-    token = getpass.getpass("Wrike token (hidden; not saved): ")
-    if not token or token != token.strip() or any(c.isspace() for c in token):
-        raise SystemExit("Token is blank or contains whitespace. Run again with the token only.")
-    print("Read-only check: GET /data_export")
-    print("This checks export access, not the selected task's historical rows.")
-    started = datetime.now(timezone.utc)
-    req = Request(ENDPOINT, headers={"Authorization": "Bearer " + token,
-                                   "Accept": "application/json"}, method="GET")
-    code, payload, retry_after = None, None, None
-    try:
-        try:
-            response = build_opener(NoRedirect()).open(req, timeout=45)
-        except HTTPError as exc:
-            response = exc
-        with response:
-            code = response.code
-            retry_after = response.headers.get("Retry-After")
-            raw = response.read(5_000_001)
-        if len(raw) > 5_000_000:
-            payload = {"error": "Response exceeded access-check size limit"}
-        else:
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeError):
-                payload = {"error": "Non-JSON response; body omitted"}
-    except (URLError, TimeoutError, OSError) as exc:
-        payload = {"error": "Network failure", "detail": str(exc)}
-    payload = sanitize(payload, token)
-    classification, explanation = interpret(code, payload)
-    output = args.output_dir or Path("output") / "bi_history_access_probe" / started.strftime("%Y%m%dT%H%M%S%fZ")
-    output.mkdir(parents=True, exist_ok=False)
-    report = {"started_utc": started.isoformat(), "method": "GET", "endpoint": ENDPOINT,
-              "http_status": code, "retry_after": sanitize(retry_after, token),
-              "classification": classification, "explanation": explanation,
-              "target_history_table": TARGET, "historical_rows_retrieved": False,
-              "payload_redacted": payload}
-    target = output / "bi_history_access_result.json"
-    target.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    print("HTTP status:", code)
-    print("Classification:", classification)
-    print(explanation)
-    if code != 200 and isinstance(payload, dict):
-        for field in ("error", "errorDescription", "detail"):
-            if field in payload:
-                print(field + ":", json.dumps(payload[field], ensure_ascii=True))
-    if retry_after:
-        print("Retry-After:", json.dumps(sanitize(retry_after, token)))
-    print("Historical task-status rows retrieved: No (access check only)")
-    print("Saved evidence:", target.resolve())
-
-
-if __name__ == "__main__":
-    main()
+WITH latest_tasks AS (
+    SELECT
+        "key"            AS task_id,
+        "title"          AS task_title,
+        "status"         AS general_status,
+        "customStatusId" AS detailed_status,
+        "createdDate"    AS created_date,
+        "updatedDate"    AS updated_date
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
+      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
+      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
+                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY "key"
+        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
+    ) = 1
+)
+SELECT detailed_status, general_status, COUNT(*) AS never_touched_task_count
+FROM latest_tasks
+WHERE TRY_TO_TIMESTAMP_TZ(created_date::VARCHAR)
+    = TRY_TO_TIMESTAMP_TZ(updated_date::VARCHAR)
+GROUP BY detailed_status, general_status
+ORDER BY never_touched_task_count DESC;
