@@ -1,98 +1,23 @@
-SELECT
-    COALESCE(NULLIF(TRIM("customStatusId"), ''), '[none]') AS detailed_status,
-    CASE WHEN "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                        "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-         THEN 'task-level' ELSE 'project / other' END       AS row_kind,
-    COUNT(*)              AS row_count,
-    COUNT(DISTINCT "key") AS distinct_keys
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("status"), '') IS NULL
-GROUP BY 1, 2
-ORDER BY row_count DESC;
-
-
-WITH all_rows AS (
-    SELECT DISTINCT
-        COALESCE(NULLIF(TRIM("status"), ''), '[none]')         AS general_status,
-        COALESCE(NULLIF(TRIM("customStatusId"), ''), '[none]') AS detailed_status
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-),
-task_level AS (
-    SELECT DISTINCT general_status, detailed_status
-    FROM (
-        SELECT
-            COALESCE(NULLIF(TRIM("status"), ''), '[none]')         AS general_status,
-            COALESCE(NULLIF(TRIM("customStatusId"), ''), '[none]') AS detailed_status,
-            ROW_NUMBER() OVER (
-                PARTITION BY "key"
-                ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
-            ) AS rn
-        FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-        WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-          AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-          AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                        "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-    )
-    WHERE rn = 1
-)
-SELECT
-    COALESCE(a.general_status, t.general_status)   AS general_status,
-    COALESCE(a.detailed_status, t.detailed_status) AS detailed_status,
-    CASE
-        WHEN a.detailed_status IS NULL THEN 'ONLY in task-level query'
-        WHEN t.detailed_status IS NULL THEN 'ONLY in all-rows DISTINCT query'
-    END AS difference
-FROM all_rows a
-FULL OUTER JOIN task_level t
-    ON  a.general_status  = t.general_status
-    AND a.detailed_status = t.detailed_status
-WHERE a.detailed_status IS NULL
-   OR t.detailed_status IS NULL
-ORDER BY difference, general_status, detailed_status;
-
-
-
-WITH task_statuses AS (
+WITH latest_tasks AS (
     SELECT
-        "key" AS task_id,
-        COALESCE(
-            NULLIF(TRIM("status"), ''),
-            '[Missing]'
-        ) AS general_status,
-        COALESCE(
-            NULLIF(TRIM("customStatusId"), ''),
-            '[Missing or unmapped]'
-        ) AS detailed_status
+        "id"             AS project_api_id,
+        "key"            AS task_id,
+        "customStatusId" AS detailed_status
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE NULLIF(TRIM("key"), '') IS NOT NULL
       AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-      AND "key" IN (
-          "parent_task_id",
-          "child_task_id",
-          "grandchild_task_id",
-          "baby_task_id",
-          "grandbaby_task_id",
-          "great_grandbaby_task_id"
-      )
+      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
+                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY "key"
+        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
+    ) = 1
 )
 SELECT
-    general_status,
-    detailed_status,
-    COUNT(DISTINCT task_id) AS distinct_task_count
-FROM task_statuses
-GROUP BY
-    general_status,
-    detailed_status
-ORDER BY
-    general_status,
-    distinct_task_count DESC,
-    detailed_status;
-
-
-
-SELECT COUNT(DISTINCT "key") AS distinct_tasks
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-  AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-  AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                "baby_task_id","grandbaby_task_id","great_grandbaby_task_id");
+    project_api_id,
+    COUNT(*) AS active_task_count
+FROM latest_tasks
+WHERE LOWER(TRIM(detailed_status)) IN ('in progress','new','not started','t - in progress')
+GROUP BY project_api_id
+ORDER BY active_task_count DESC
+LIMIT 20;
