@@ -1,21 +1,17 @@
-WITH latest_tasks AS (
-    SELECT
-        "id"                           AS project_api_id,
-        LOWER(TRIM("customStatusId"))  AS detailed_status
+WITH active_candidates AS (
+    SELECT "id" AS project_api_id, COUNT(*) AS recent_in_progress
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE NULLIF(TRIM("key"), '') IS NOT NULL
       AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
       AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
                     "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY "key"
-        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id") = 1
-),
-chosen_project AS (
-    SELECT project_api_id
-    FROM latest_tasks
-    GROUP BY project_api_id
-    ORDER BY SUM(CASE WHEN detailed_status IN ('in progress','new','not started','t - in progress')
-                      THEN 1 ELSE 0 END) DESC NULLS LAST
+      AND LOWER(TRIM("customStatusId")) = 'in progress'
+      AND TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) >= DATEADD('day', -30, CURRENT_TIMESTAMP())
+      AND LOWER("title") NOT LIKE '%blueprint%'
+      AND LOWER("title") NOT LIKE '%deprecated%'
+      AND LOWER("title") NOT LIKE '%template%'
+    GROUP BY "id"
+    ORDER BY recent_in_progress DESC
     LIMIT 1
 )
 SELECT
@@ -29,7 +25,7 @@ SELECT
     w."customStatusId" AS detailed_status,
     w."updatedDate"    AS updated_date
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
-WHERE w."id" IN (SELECT project_api_id FROM chosen_project)
+WHERE w."id" IN (SELECT project_api_id FROM active_candidates)
   AND NULLIF(TRIM(w."key"), '') IS NOT NULL
   AND UPPER(TRIM(w."key")) <> 'PLACEHOLDER'
 QUALIFY ROW_NUMBER() OVER (PARTITION BY w."key"
