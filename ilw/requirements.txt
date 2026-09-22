@@ -1,9 +1,314 @@
-SELECT DISTINCT
-    "id" AS project_id,
-    "title" AS project_name
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "key" = "id"
-  AND UPPER(TRIM("is_project"::VARCHAR)) = 'Y'
-  AND NULLIF(TRIM("id"), '') IS NOT NULL
-  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-ORDER BY project_name, project_id;
+#!/usr/bin/env python3
+"""Read-only Wrike project visibility comparison; Python 3.9+, standard library.
+
+Run beside the Snowflake CSV:
+  python3 compare_project_access.py --baseline snowflake_project_baseline_2026-09-22.csv
+
+The hidden token prompt accepts Akash's new token. No Snowflake connection,
+production code import, external writes, or token persistence is performed.
+Account-wide visible projects are compared by case-sensitive IDs, not titles.
+Projects missing from the paginated listing are checked individually.
+Missing means not retrievable during this run, NOT proven permission loss.
+Snapshot timing, deleted items and baseline scope must still be reviewed.
+
+API references:
+https://developers.wrike.com/reference/getfoldersempty
+https://developers.wrike.com/reference/getfoldersmulti
+"""
+
+import argparse
+import csv
+import getpass
+import hashlib
+import json
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+API = "https://www.wrike.com/api/v4/"
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+class CheckError(Exception):
+    pass
+
+
+class ApiError(CheckError):
+    def __init__(self, status, message):
+        self.status = status
+        super().__init__(message)
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Client:
+    def __init__(self, token):
+        self.token = token
+        self.opener = build_opener(NoRedirect())
+
+    def get(self, path, params=None):
+        url = API + path
+        if params:
+            url += "?" + urlencode(params)
+        for attempt in range(5):
+            retry_after = None
+            try:
+                request = Request(url, headers={
+                    "Authorization": "Bearer " + self.token,
+                    "Accept": "application/json",
+                }, method="GET")
+                with self.opener.open(request, timeout=60) as response:
+                    body = response.read()
+                try:
+                    return json.loads(body)
+                except (ValueError, UnicodeError):
+                    raise ApiError(200, "Response was not valid JSON") from None
+            except HTTPError as exc:
+                status = exc.code
+                retry_after = exc.headers.get("Retry-After")
+                exc.close()
+                if status not in (429, 500, 502, 503, 504):
+                    raise ApiError(status, "HTTP " + str(status)) from None
+                failure = ApiError(status, "Retries exhausted: HTTP " + str(status))
+            except (URLError, TimeoutError, OSError):
+                failure = ApiError(None, "Network request failed after retries")
+            if attempt == 4:
+                raise failure
+            delay = min(60, 5 * (2 ** attempt))
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    try:
+                        delay = max(delay, (parsedate_to_datetime(retry_after)
+                                           - datetime.now(timezone.utc)).total_seconds())
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+            if delay > 300:
+                raise ApiError(429, "Server requested a long retry delay; rerun later")
+            print("Temporary request failure; retrying in %.0f seconds." % delay,
+                  flush=True)
+            while delay > 0:
+                chunk = min(60, delay)
+                time.sleep(chunk)
+                delay -= chunk
+
+
+def load_baseline(path):
+    projects = {}
+    input_rows = 0
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = {name.strip().lower(): name for name in (reader.fieldnames or [])}
+        if not {"project_id", "project_name"}.issubset(fields):
+            raise CheckError("CSV needs PROJECT_ID and PROJECT_NAME columns")
+        for row in reader:
+            input_rows += 1
+            project_id = (row.get(fields["project_id"]) or "").strip()
+            name = (row.get(fields["project_name"]) or "").strip()
+            if not project_id or project_id.upper() in ("PLACEHOLDER", "NULL"):
+                raise CheckError("Invalid project ID in CSV record %s" % input_rows)
+            if not name:
+                raise CheckError("Missing project name in CSV record %s" % input_rows)
+            if project_id in projects and projects[project_id] != name:
+                raise CheckError("One project ID has conflicting names in baseline; "
+                                 "resolve duplicate IDs before comparison")
+            projects[project_id] = name
+    if not projects:
+        raise CheckError("Baseline is empty")
+    return projects, input_rows
+
+
+def records(payload):
+    if (not isinstance(payload, dict) or payload.get("kind") != "folders"
+            or not isinstance(payload.get("data"), list)):
+        raise CheckError("Unexpected API response shape; cannot establish coverage")
+    for item in payload["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            raise CheckError("Invalid item in API response")
+    return payload["data"]
+
+
+def project_info(item):
+    if not isinstance(item.get("project"), dict):
+        raise CheckError("Response item is not identified as a project")
+    return {"project_id": item["id"], "project_name": item.get("title", ""),
+            "account_id": item.get("accountId", "")}
+
+
+def inventory(client):
+    projects, tokens = {}, set()
+    params = {"project": "true", "deleted": "false", "pageSize": "1000"}
+    page = 0
+    while True:
+        payload = client.get("folders", params)
+        for item in records(payload):
+            info = project_info(item)
+            if item["id"] in projects and projects[item["id"]] != info:
+                raise CheckError("Conflicting duplicate project in API pages; rerun")
+            projects[item["id"]] = info
+        page += 1
+        print("Page %s: %s unique projects retrieved." % (page, len(projects)), flush=True)
+        token = payload.get("nextPageToken")
+        if token is None or token == "":
+            return projects, page
+        if not isinstance(token, str) or token in tokens:
+            raise CheckError("Invalid or repeated pagination token")
+        tokens.add(token)
+        params["nextPageToken"] = token
+
+
+def check_missing(client, project_id):
+    try:
+        payload = client.get("folders/" + quote(project_id, safe=""))
+        items = records(payload)
+        if payload.get("nextPageToken"):
+            raise CheckError("Unexpected pagination on individual lookup")
+        if not items:
+            return "NOT_RETURNED", 200, ""
+        if len(items) != 1 or items[0]["id"] != project_id:
+            raise CheckError("Lookup returned a different or ambiguous ID")
+        item = items[0]
+        if not isinstance(item.get("project"), dict):
+            return "VISIBLE_NONPROJECT", 200, item.get("title", "")
+        return "VISIBLE_BY_DIRECT_LOOKUP", 200, item.get("title", "")
+    except ApiError as exc:
+        if exc.status == 401:
+            raise
+        if exc.status == 403:
+            return "FORBIDDEN", 403, ""
+        if exc.status == 404:
+            return "NOT_FOUND", 404, ""
+        return "UNRESOLVED", exc.status or "", ""
+    except CheckError:
+        return "UNRESOLVED", "", ""
+
+
+def compare(baseline, visible, client):
+    rows = []
+    candidates = sum(pid not in visible for pid in baseline)
+    checked = 0
+    for project_id, name in sorted(baseline.items(), key=lambda item: (item[1], item[0])):
+        if project_id in visible:
+            state, status, api_name = "VISIBLE_IN_LIST", 200, visible[project_id]["project_name"]
+        else:
+            checked += 1
+            print("Checking absent project %s of %s." % (checked, candidates), flush=True)
+            state, status, api_name = check_missing(client, project_id)
+        rows.append({"project_id": project_id, "project_name": name,
+                     "api_project_name": api_name, "classification": state,
+                     "http_status": status})
+    return rows
+
+
+def write_csv(path, rows, fields):
+    # Prefix spreadsheet formula-like text on export only; comparison uses raw IDs.
+    def safe(value):
+        if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows({key: safe(value) for key, value in row.items()} for row in rows)
+
+
+def reports(output, rows, summary):
+    write_csv(output / "comparison.csv", rows,
+              ["project_id", "project_name", "api_project_name", "classification", "http_status"])
+    counts = {}
+    for row in rows:
+        state = row["classification"]
+        counts[state] = counts.get(state, 0) + 1
+    summary["classifications"] = counts
+    missing = [row for row in rows if row["classification"] in
+               ("FORBIDDEN", "NOT_FOUND", "NOT_RETURNED")]
+    summary["not_retrievable_count"] = len(missing)
+    summary["status"] = "INCOMPLETE" if counts.get("UNRESOLVED") else "COMPLETE"
+    summary["interpretation"] = (
+        "Not retrievable during this run; not proof of permission loss. "
+        "Snowflake and API snapshots differ in time. Review deletion, baseline "
+        "scope and any VISIBLE_NONPROJECT rows before reporting an access cause. "
+        "Names are labels; matching used exact IDs."
+    )
+    write_csv(output / "not_retrievable_projects.csv", missing,
+              ["project_id", "project_name", "classification", "http_status"])
+    if summary["status"] == "COMPLETE":
+        names = "\n".join(row["project_name"].replace("\n", " ").replace("\r", " ")
+                          for row in missing)
+        (output / "project_names_for_akash.txt").write_text(
+            "Snowflake baseline projects not retrievable using the supplied token: %s\n"
+            "Checked at: %s\n"
+            "This is observed availability, not a confirmed permission diagnosis.\n\n%s\n"
+            % (len(missing), utc_now(), names), encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument("--output", type=Path, default=Path("output/access_comparison"))
+    args = parser.parse_args()
+    try:
+        baseline, input_rows = load_baseline(args.baseline)
+    except (CheckError, OSError, UnicodeError, csv.Error) as exc:
+        print("Baseline error:", exc, file=sys.stderr)
+        return 1
+    print("Baseline: %s rows; %s unique project IDs." % (input_rows, len(baseline)))
+    if not sys.stdin.isatty():
+        print("Run in an interactive terminal for the hidden token prompt.", file=sys.stderr)
+        return 1
+    token = getpass.getpass("Akash's Wrike token (hidden; never saved): ").strip()
+    if not token or "\n" in token or "\r" in token:
+        print("Token is empty or invalid.", file=sys.stderr)
+        return 1
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8]
+    output = args.output / run_id
+    output.mkdir(parents=True, exist_ok=False)
+    summary = {"run_id": run_id, "started_at": utc_now(), "status": "FAILED",
+               "baseline_file": args.baseline.name,
+               "baseline_sha256": hashlib.sha256(args.baseline.read_bytes()).hexdigest(),
+               "baseline_rows": input_rows, "baseline_unique_ids": len(baseline),
+               "scope": "All non-deleted projects visible to token; direct lookup of absent baseline IDs"}
+    try:
+        client = Client(token)
+        visible, pages = inventory(client)
+        summary.update({"inventory_pages": pages, "visible_inventory_count": len(visible),
+                        "returned_account_ids": sorted({v["account_id"] for v in visible.values()
+                                                        if v["account_id"]})})
+        write_csv(output / "visible_projects.csv", list(visible.values()),
+                  ["project_id", "project_name", "account_id"])
+        rows = compare(baseline, visible, client)
+        reports(output, rows, summary)
+    except (CheckError, OSError) as exc:
+        summary["error"] = str(exc)
+        print("Comparison stopped:", exc, file=sys.stderr)
+    except KeyboardInterrupt:
+        summary["error"] = "Interrupted by user"
+    finally:
+        summary["finished_at"] = utc_now()
+        (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    print("Local evidence:", output.resolve())
+    if summary["status"] != "COMPLETE":
+        print("Do not report a final missing-project count: comparison is incomplete.")
+        return 1
+    print("Review comparison.csv, then share only project_names_for_akash.txt as requested.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
