@@ -1,22 +1,28 @@
-SELECT project_api_id, project_name
-FROM (
-    SELECT
-        "id"                                          AS project_api_id,
-        MAX(CASE WHEN "key" = "id" THEN "title" END)  AS project_name
+WITH baseline AS (
+    SELECT DISTINCT "id"
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("id"), '') IS NOT NULL
+    WHERE "key" = "id"
+      AND UPPER(TRIM("is_project"::VARCHAR)) = 'Y'
+      AND NULLIF(TRIM("id"), '') IS NOT NULL
       AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-    GROUP BY "id"
 )
-WHERE project_name IS NOT NULL
-ORDER BY project_name;
-
-
-
-
-SELECT COLUMN_NAME
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE UPPER(TABLE_SCHEMA) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND UPPER(TABLE_NAME)   = 'WRIKE_STG'
-  AND (LOWER(COLUMN_NAME) LIKE '%title%' OR LOWER(COLUMN_NAME) LIKE '%name%')
-ORDER BY ORDINAL_POSITION;
+SELECT
+    s."id" AS container_id,
+    MAX(CASE
+        WHEN s."key" = s."id" THEN s."title"
+    END) AS container_name,
+    MAX(CASE
+        WHEN s."key" = s."id" THEN s."is_project"::VARCHAR
+    END) AS own_row_is_project,
+    COUNT_IF(s."key" = s."id") AS own_row_count,
+    COUNT(*) AS physical_rows
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" s
+WHERE NULLIF(TRIM(s."id"), '') IS NOT NULL
+  AND UPPER(TRIM(s."id")) <> 'PLACEHOLDER'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM baseline b
+      WHERE b."id" = s."id"
+  )
+GROUP BY s."id"
+ORDER BY container_name, container_id;
