@@ -1,33 +1,42 @@
-WITH active_candidates AS (
-    SELECT "id" AS project_api_id, COUNT(*) AS recent_in_progress
+WITH project_candidates AS (
+    SELECT DISTINCT
+        "id" AS project_id,
+        "title" AS project_title,
+        "customStatusId" AS current_status,
+        TRY_TO_TIMESTAMP_TZ(
+            "updatedDate"::VARCHAR
+        ) AS updated_at
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-      AND LOWER(TRIM("customStatusId")) = 'in progress'
-      AND TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) >= DATEADD('day', -30, CURRENT_TIMESTAMP())
-      AND LOWER("title") NOT LIKE '%blueprint%'
-      AND LOWER("title") NOT LIKE '%deprecated%'
-      AND LOWER("title") NOT LIKE '%template%'
-    GROUP BY "id"
-    ORDER BY recent_in_progress DESC
-    LIMIT 1
+    WHERE "key" = "id"
+      AND LOWER(TRIM("is_project"::VARCHAR)) = 'true'
+      AND LOWER(TRIM("customStatusId")) IN (
+          'new',
+          'not started',
+          'in progress',
+          'in requirements',
+          'pm pending',
+          'planning',
+          'planning/resourcing',
+          'resourcing',
+          'resource confirmed',
+          'on track',
+          'on track*',
+          'at risk'
+      )
+      AND "title" NOT ILIKE '%deprecated%'
+      AND "title" NOT ILIKE '%blueprint%'
 )
 SELECT
-    w."id"             AS project_api_id,
-    CASE WHEN w."key" IN (w."parent_task_id", w."child_task_id", w."grandchild_task_id",
-                          w."baby_task_id", w."grandbaby_task_id", w."great_grandbaby_task_id")
-         THEN 'task' ELSE 'project / other' END AS entity_kind,
-    w."key"            AS entity_id,
-    w."title"          AS title,
-    w."status"         AS general_status,
-    w."customStatusId" AS detailed_status,
-    w."updatedDate"    AS updated_date
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
-WHERE w."id" IN (SELECT project_api_id FROM active_candidates)
-  AND NULLIF(TRIM(w."key"), '') IS NOT NULL
-  AND UPPER(TRIM(w."key")) <> 'PLACEHOLDER'
-QUALIFY ROW_NUMBER() OVER (PARTITION BY w."key"
-    ORDER BY TRY_TO_TIMESTAMP_TZ(w."updatedDate"::VARCHAR) DESC NULLS LAST, w."id") = 1
-ORDER BY entity_kind, detailed_status, title;
+    project_id,
+    project_title,
+    current_status,
+    updated_at
+FROM project_candidates
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY project_id
+    ORDER BY updated_at DESC NULLS LAST,
+             current_status,
+             project_title
+) = 1
+ORDER BY updated_at DESC NULLS LAST, project_id
+LIMIT 10;
