@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "run_id": "SYNTHETIC_RUN_4",
+  "source": "SYNTHETIC_TEST",
+  "complete": true,
+  "account_id": "SYNTHETIC_ACCOUNT",
+  "requested_project_ids": [
+    "SYNTHETIC_PROJECT"
+  ],
+  "capture_started_at": "2026-01-01T08:00:00+00:00",
+  "capture_finished_at": "2026-01-01T08:00:00+00:00",
+  "projects": [
+    {
+      "observed_at": "2026-01-01T08:00:00+00:00",
+      "data": {
+        "id": "SYNTHETIC_PROJECT",
+        "accountId": "SYNTHETIC_ACCOUNT",
+        "title": "Synthetic project",
+        "updatedDate": "2026-01-01T08:00:00+00:00",
+        "project": {
+          "customStatusId": "S_IN_PROGRESS"
+        }
+      }
+    }
+  ]
+}

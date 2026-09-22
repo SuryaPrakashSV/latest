@@ -1,0 +1,2 @@
+project_id,custom_status_id,observed_at,source_updated_at,raw_json
+SYNTHETIC_PROJECT,S_IN_PROGRESS,2026-01-01T08:00:00.000000+00:00,2026-01-01T08:00:00.000000+00:00,"{""accountId"":""SYNTHETIC_ACCOUNT"",""id"":""SYNTHETIC_PROJECT"",""project"":{""customStatusId"":""S_IN_PROGRESS""},""title"":""Synthetic project"",""updatedDate"":""2026-01-01T08:00:00+00:00""}"

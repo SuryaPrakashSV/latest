@@ -1,0 +1,57 @@
+[
+  {
+    "run_id": "SYNTHETIC_RUN_1",
+    "source": "SYNTHETIC_TEST",
+    "projects": 1,
+    "new_baselines": 1,
+    "status_changed": 0,
+    "unchanged": 0,
+    "inserted_versions": 1,
+    "replayed": false
+  },
+  {
+    "run_id": "SYNTHETIC_RUN_2",
+    "source": "SYNTHETIC_TEST",
+    "projects": 1,
+    "new_baselines": 0,
+    "status_changed": 0,
+    "unchanged": 1,
+    "inserted_versions": 0,
+    "replayed": false
+  },
+  {
+    "run_id": "SYNTHETIC_RUN_3",
+    "source": "SYNTHETIC_TEST",
+    "projects": 1,
+    "new_baselines": 0,
+    "status_changed": 1,
+    "unchanged": 0,
+    "inserted_versions": 1,
+    "replayed": false
+  },
+  {
+    "run_id": "SYNTHETIC_RUN_4",
+    "source": "SYNTHETIC_TEST",
+    "projects": 1,
+    "new_baselines": 0,
+    "status_changed": 1,
+    "unchanged": 0,
+    "inserted_versions": 1,
+    "replayed": false
+  },
+  {
+    "run_id": "SYNTHETIC_RUN_4",
+    "replayed": true,
+    "inserted_versions": 0,
+    "original_summary": {
+      "inserted_versions": 1,
+      "new_baselines": 0,
+      "projects": 1,
+      "replayed": false,
+      "run_id": "SYNTHETIC_RUN_4",
+      "source": "SYNTHETIC_TEST",
+      "status_changed": 1,
+      "unchanged": 0
+    }
+  }
+]
