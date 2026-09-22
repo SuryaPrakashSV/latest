@@ -1,32 +1,35 @@
-SELECT DISTINCT
-    "status"         AS general_status,
-    "customStatusId" AS detailed_status
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("customStatusId"), '') IS NOT NULL
-ORDER BY general_status, detailed_status;
-
-SELECT
-    COUNT(DISTINCT "customStatusId") AS distinct_detailed_statuses,
-    COUNT(DISTINCT "status")         AS distinct_general_statuses
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("customStatusId"), '') IS NOT NULL;
-
-WITH latest_tasks AS (
+WITH task_statuses AS (
     SELECT
-        "key"            AS task_id,
-        "status"         AS general_status,
-        "customStatusId" AS detailed_status
+        "key" AS task_id,
+        COALESCE(
+            NULLIF(TRIM("status"), ''),
+            '[Missing]'
+        ) AS general_status,
+        COALESCE(
+            NULLIF(TRIM("customStatusId"), ''),
+            '[Missing or unmapped]'
+        ) AS detailed_status
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE NULLIF(TRIM("key"), '') IS NOT NULL
       AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY "key"
-        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
-    ) = 1
+      AND "key" IN (
+          "parent_task_id",
+          "child_task_id",
+          "grandchild_task_id",
+          "baby_task_id",
+          "grandbaby_task_id",
+          "great_grandbaby_task_id"
+      )
 )
-SELECT general_status, detailed_status, COUNT(*) AS task_count
-FROM latest_tasks
-GROUP BY general_status, detailed_status
-ORDER BY task_count DESC;
+SELECT
+    general_status,
+    detailed_status,
+    COUNT(DISTINCT task_id) AS distinct_task_count
+FROM task_statuses
+GROUP BY
+    general_status,
+    detailed_status
+ORDER BY
+    general_status,
+    distinct_task_count DESC,
+    detailed_status;
