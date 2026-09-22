@@ -1,1 +1,1 @@
-python3 compare_project_access.py --baseline snowflake_project_baseline_2026-09-22.csv
+grep -nE 'WRIKE_TOKEN|TOKEN|Authorization|Bearer|getpass|headers' wrike_extract_working.py | head -50
