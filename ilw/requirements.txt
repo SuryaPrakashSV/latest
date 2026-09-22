@@ -1,83 +1,40 @@
-WITH projects AS (
+WITH latest_tasks AS (
     SELECT
-        "id" AS project_id,
-        "title" AS project_title,
-        "customStatusId" AS project_status,
-        TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) AS project_updated_at
+        "key" AS task_id,
+        "status" AS general_status,
+        "customStatusId" AS detailed_status,
+        TRY_TO_TIMESTAMP_TZ(
+            "updatedDate"::VARCHAR
+        ) AS task_updated_at
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "key" = "id"
-      AND UPPER(TRIM("is_project"::VARCHAR)) = 'Y'
-      AND LOWER(TRIM("customStatusId")) IN (
-          'new', 'not started', 'in progress', 'in requirements',
-          'pm pending', 'planning', 'planning/resourcing',
-          'resourcing', 'resource confirmed',
-          'on track', 'on track*', 'at risk'
-      )
-      AND "title" NOT ILIKE '%deprecated%'
-      AND "title" NOT ILIKE '%blueprint%'
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY "id"
-        ORDER BY project_updated_at DESC NULLS LAST,
-                 project_status, project_title
-    ) = 1
-),
-candidates AS (
-    SELECT *
-    FROM projects
-    ORDER BY project_updated_at DESC NULLS LAST, project_id
-    LIMIT 10
-),
-tasks AS (
-    SELECT
-        s."id" AS project_id,
-        s."key" AS task_id,
-        LOWER(TRIM(s."status")) AS general_status,
-        TRY_TO_TIMESTAMP_TZ(s."updatedDate"::VARCHAR) AS task_updated_at
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" s
-    INNER JOIN candidates p
-        ON s."id" = p.project_id
-    WHERE NULLIF(TRIM(s."key"), '') IS NOT NULL
-      AND UPPER(TRIM(s."key")) <> 'PLACEHOLDER'
-      AND s."key" <> s."id"
-      AND s."key" IN (
-          s."parent_task_id",
-          s."child_task_id",
-          s."grandchild_task_id",
-          s."baby_task_id",
-          s."grandbaby_task_id",
-          s."great_grandbaby_task_id"
+    WHERE "id" = 'MQAAAAEKLDyQ'
+      AND NULLIF(TRIM("key"), '') IS NOT NULL
+      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
+      AND "key" <> "id"
+      AND "key" IN (
+          "parent_task_id",
+          "child_task_id",
+          "grandchild_task_id",
+          "baby_task_id",
+          "grandbaby_task_id",
+          "great_grandbaby_task_id"
       )
     QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY s."id", s."key"
+        PARTITION BY "key"
         ORDER BY task_updated_at DESC NULLS LAST,
-                 s."status", s."customStatusId"
+                 "status",
+                 "customStatusId"
     ) = 1
 )
 SELECT
-    p.project_id,
-    p.project_title,
-    p.project_status,
-    p.project_updated_at,
-    COUNT(t.task_id) AS distinct_tasks,
-    SUM(IFF(t.general_status = 'active', 1, 0)) AS active_tasks,
-    SUM(IFF(t.general_status = 'deferred', 1, 0)) AS deferred_tasks,
-    SUM(IFF(t.general_status = 'completed', 1, 0)) AS completed_tasks,
-    SUM(IFF(t.general_status = 'cancelled', 1, 0)) AS cancelled_tasks,
+    general_status,
+    detailed_status,
+    COUNT(*) AS task_count,
     SUM(IFF(
-        t.general_status = 'active'
-        AND t.task_updated_at >= DATEADD('hour', -48, CURRENT_TIMESTAMP()),
+        task_updated_at >= DATEADD('hour', -48, CURRENT_TIMESTAMP()),
         1, 0
-    )) AS active_tasks_updated_last_48h,
-    MAX(t.task_updated_at) AS latest_task_update
-FROM candidates p
-LEFT JOIN tasks t
-    ON p.project_id = t.project_id
-GROUP BY
-    p.project_id,
-    p.project_title,
-    p.project_status,
-    p.project_updated_at
-ORDER BY
-    active_tasks_updated_last_48h DESC,
-    active_tasks DESC,
-    distinct_tasks DESC;
+    )) AS tasks_updated_last_48h,
+    MAX(task_updated_at) AS latest_task_update
+FROM latest_tasks
+GROUP BY general_status, detailed_status
+ORDER BY task_count DESC, detailed_status;
