@@ -1,1 +1,37 @@
-python3 project_history.py export --db output/live/project_history.sqlite --output output/live/export
+WITH latest_tasks AS (
+    SELECT
+        "id"                           AS project_api_id,
+        LOWER(TRIM("customStatusId"))  AS detailed_status
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
+      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
+      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
+                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY "key"
+        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id") = 1
+),
+chosen_project AS (
+    SELECT project_api_id
+    FROM latest_tasks
+    GROUP BY project_api_id
+    ORDER BY SUM(CASE WHEN detailed_status IN ('in progress','new','not started','t - in progress')
+                      THEN 1 ELSE 0 END) DESC NULLS LAST
+    LIMIT 1
+)
+SELECT
+    w."id"             AS project_api_id,
+    CASE WHEN w."key" IN (w."parent_task_id", w."child_task_id", w."grandchild_task_id",
+                          w."baby_task_id", w."grandbaby_task_id", w."great_grandbaby_task_id")
+         THEN 'task' ELSE 'project / other' END AS entity_kind,
+    w."key"            AS entity_id,
+    w."title"          AS title,
+    w."status"         AS general_status,
+    w."customStatusId" AS detailed_status,
+    w."updatedDate"    AS updated_date
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
+WHERE w."id" IN (SELECT project_api_id FROM chosen_project)
+  AND NULLIF(TRIM(w."key"), '') IS NOT NULL
+  AND UPPER(TRIM(w."key")) <> 'PLACEHOLDER'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY w."key"
+    ORDER BY TRY_TO_TIMESTAMP_TZ(w."updatedDate"::VARCHAR) DESC NULLS LAST, w."id") = 1
+ORDER BY entity_kind, detailed_status, title;
