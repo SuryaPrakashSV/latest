@@ -1,17 +1,24 @@
-SELECT COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE UPPER(TABLE_SCHEMA) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND UPPER(TABLE_NAME)   = 'WRIKE_STG'
-  AND (LOWER(COLUMN_NAME) LIKE '%creat%'
-    OR LOWER(COLUMN_NAME) LIKE '%start%'
-    OR LOWER(COLUMN_NAME) LIKE '%date%')
-ORDER BY ORDINAL_POSITION;
-
-
-
-SELECT COLUMN_NAME, DATA_TYPE
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE UPPER(TABLE_SCHEMA) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND UPPER(TABLE_NAME)  = 'WRIKE_STG'
-  AND LOWER(COLUMN_NAME) LIKE '%date%'
-ORDER BY COLUMN_NAME;
+WITH latest_tasks AS (
+    SELECT
+        "key"            AS task_id,
+        "customStatusId" AS detailed_status,
+        "createdDate"    AS created_date,
+        "updatedDate"    AS updated_date
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
+      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
+      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
+                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY "key"
+        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
+    ) = 1
+)
+SELECT
+    detailed_status AS first_status,
+    COUNT(*)        AS tasks_created_into_this_status,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct_of_never_touched
+FROM latest_tasks
+WHERE TRY_TO_TIMESTAMP_TZ(created_date::VARCHAR) = TRY_TO_TIMESTAMP_TZ(updated_date::VARCHAR)
+GROUP BY detailed_status
+ORDER BY tasks_created_into_this_status DESC;
