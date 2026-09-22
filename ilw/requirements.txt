@@ -1,42 +1,13 @@
-WITH project_candidates AS (
-    SELECT DISTINCT
-        "id" AS project_id,
-        "title" AS project_title,
-        "customStatusId" AS current_status,
-        TRY_TO_TIMESTAMP_TZ(
-            "updatedDate"::VARCHAR
-        ) AS updated_at
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "key" = "id"
-      AND LOWER(TRIM("is_project"::VARCHAR)) = 'true'
-      AND LOWER(TRIM("customStatusId")) IN (
-          'new',
-          'not started',
-          'in progress',
-          'in requirements',
-          'pm pending',
-          'planning',
-          'planning/resourcing',
-          'resourcing',
-          'resource confirmed',
-          'on track',
-          'on track*',
-          'at risk'
-      )
-      AND "title" NOT ILIKE '%deprecated%'
-      AND "title" NOT ILIKE '%blueprint%'
-)
 SELECT
-    project_id,
-    project_title,
-    current_status,
-    updated_at
-FROM project_candidates
-QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY project_id
-    ORDER BY updated_at DESC NULLS LAST,
-             current_status,
-             project_title
-) = 1
-ORDER BY updated_at DESC NULLS LAST, project_id
-LIMIT 10;
+    "is_project"::VARCHAR AS is_project_value,
+    COUNT(*) AS total_rows,
+    COUNT_IF("key" = "id") AS key_equals_id_rows,
+    COUNT_IF(
+        NULLIF(TRIM("key"::VARCHAR), '') IS NULL
+    ) AS missing_key_rows,
+    MAX(
+        TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR)
+    ) AS most_recent_update
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+GROUP BY "is_project"::VARCHAR
+ORDER BY total_rows DESC;
