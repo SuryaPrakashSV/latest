@@ -1,8 +1,8 @@
 WITH latest_tasks AS (
     SELECT
-        "id"             AS project_api_id,
-        "key"            AS task_id,
-        "customStatusId" AS detailed_status
+        "id"                           AS project_api_id,
+        "key"                          AS task_id,
+        LOWER(TRIM("customStatusId"))  AS detailed_status
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE NULLIF(TRIM("key"), '') IS NOT NULL
       AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
@@ -15,33 +15,14 @@ WITH latest_tasks AS (
 )
 SELECT
     project_api_id,
-    COUNT(*)                                                                                          AS total_tasks,
-    COUNT_IF(LOWER(TRIM(detailed_status)) IN ('in progress','new','not started','t - in progress'))   AS active_tasks
+    COUNT(*) AS total_tasks,
+    SUM(CASE WHEN detailed_status IN ('in progress','new','not started','t - in progress')
+             THEN 1 ELSE 0 END) AS active_tasks
 FROM latest_tasks
 GROUP BY project_api_id
-HAVING active_tasks > 0
-ORDER BY active_tasks DESC
+ORDER BY active_tasks DESC NULLS LAST, total_tasks DESC
 LIMIT 15;
 
-
-WITH latest_tasks AS (
-    SELECT
-        "key"            AS task_id,
-        "title"          AS task_title,
-        "status"         AS general_status,
-        "customStatusId" AS detailed_status,
-        "updatedDate"    AS updated_date
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = '<PASTE_PROJECT_ID_HERE>'
-      AND NULLIF(TRIM("key"), '') IS NOT NULL
-      AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY "key"
-        ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
-    ) = 1
-)
-SELECT task_id, task_title, general_status, detailed_status, updated_date
-FROM latest_tasks
-ORDER BY detailed_status, task_title;
+SELECT COUNT(*) AS in_progress_rows
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE LOWER(TRIM("customStatusId")) = 'in progress';
