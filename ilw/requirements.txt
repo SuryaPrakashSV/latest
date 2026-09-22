@@ -1,28 +1,31 @@
-WITH latest_tasks AS (
+WITH project_rows AS (
     SELECT
-        "id"                           AS project_api_id,
-        "key"                          AS task_id,
-        LOWER(TRIM("customStatusId"))  AS detailed_status
+        "key"            AS entity_id,
+        "title"          AS title,
+        "status"         AS general_status,
+        "customStatusId" AS detailed_status,
+        "updatedDate"    AS updated_date,
+        CASE
+            WHEN "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
+                           "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
+            THEN 'task'
+            ELSE 'project / other'
+        END AS entity_kind
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
+    WHERE "id" = '<PASTE_PROJECT_ID_HERE>'
+      AND NULLIF(TRIM("key"), '') IS NOT NULL
       AND UPPER(TRIM("key")) <> 'PLACEHOLDER'
-      AND "key" IN ("parent_task_id","child_task_id","grandchild_task_id",
-                    "baby_task_id","grandbaby_task_id","great_grandbaby_task_id")
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY "key"
         ORDER BY TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) DESC NULLS LAST, "id"
     ) = 1
 )
 SELECT
-    project_api_id,
-    COUNT(*) AS total_tasks,
-    SUM(CASE WHEN detailed_status IN ('in progress','new','not started','t - in progress')
-             THEN 1 ELSE 0 END) AS active_tasks
-FROM latest_tasks
-GROUP BY project_api_id
-ORDER BY active_tasks DESC NULLS LAST, total_tasks DESC
-LIMIT 15;
-
-SELECT COUNT(*) AS in_progress_rows
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE LOWER(TRIM("customStatusId")) = 'in progress';
+    entity_kind,
+    entity_id,
+    title,
+    general_status,
+    detailed_status,
+    updated_date
+FROM project_rows
+ORDER BY entity_kind, detailed_status, title;
