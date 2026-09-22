@@ -1,31 +1,22 @@
-WITH project_activity AS (
+SELECT project_api_id, project_name
+FROM (
     SELECT
-        "id" AS project_api_id,
-        MAX(CASE WHEN LOWER(TRIM("customStatusId")) = 'in progress'
-                  AND TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR) >= DATEADD('day', -30, CURRENT_TIMESTAMP())
-                  AND LOWER("title") NOT LIKE '%blueprint%'
-                  AND LOWER("title") NOT LIKE '%deprecated%'
-                  AND LOWER("title") NOT LIKE '%template%'
-                 THEN 1 ELSE 0 END) AS is_active
+        "id"                                          AS project_api_id,
+        MAX(CASE WHEN "key" = "id" THEN "title" END)  AS project_name
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE NULLIF(TRIM("id"), '') IS NOT NULL
       AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
     GROUP BY "id"
 )
-SELECT
-    COUNT(*)                          AS total_projects,
-    SUM(is_active)                    AS active_projects,
-    COUNT(*) - SUM(is_active)         AS inactive_or_template_projects
-FROM project_activity;
-
-
-
-
-SELECT
-    "id"                                          AS project_api_id,
-    MAX(CASE WHEN "key" = "id" THEN "title" END)  AS project_name
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("id"), '') IS NOT NULL
-  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-GROUP BY "id"
+WHERE project_name IS NOT NULL
 ORDER BY project_name;
+
+
+
+
+SELECT COLUMN_NAME
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE UPPER(TABLE_SCHEMA) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND UPPER(TABLE_NAME)   = 'WRIKE_STG'
+  AND (LOWER(COLUMN_NAME) LIKE '%title%' OR LOWER(COLUMN_NAME) LIKE '%name%')
+ORDER BY ORDINAL_POSITION;
