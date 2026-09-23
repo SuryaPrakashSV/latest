@@ -1,13 +1,17 @@
-SELECT DISTINCT
+SELECT
     "id" AS entity_id,
-    "title" AS entity_name,
-    "is_project" AS is_project
+    MAX(TRIM("title")) AS entity_name
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
 WHERE "key" = "id"
-  AND "title" IN (
-      'Intake Form - Resourcing Template',
-      'NPI Project Blueprints',
-      'Test Import',
-      'xxOLD Blueprints'
-  )
+  AND NULLIF(TRIM("id"), '') IS NOT NULL
+  AND UPPER(TRIM("id")) NOT IN ('PLACEHOLDER', 'NULL')
+  AND NULLIF(TRIM("title"), '') IS NOT NULL
+  AND UPPER(TRIM("title")) <> 'NULL'
+GROUP BY "id"
+HAVING MAX(
+    CASE
+        WHEN UPPER(TRIM("is_project"::VARCHAR)) = 'Y'
+        THEN 1 ELSE 0
+    END
+) = 0
 ORDER BY entity_name, entity_id;
