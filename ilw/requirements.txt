@@ -1,241 +1,76 @@
 WITH source_data AS (
-    SELECT *
+    SELECT
+        NULLIF(TRIM("id"), '')         AS container_id,
+        NULLIF(TRIM("key"), '')        AS entity_id,
+        UPPER(TRIM("is_project"))      AS project_flag
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
 ),
-project_count AS (
-    SELECT
-        COUNT(DISTINCT TRIM("id")) AS snowflake_project_count
+folder_keys AS (
+    SELECT DISTINCT entity_id
     FROM source_data
-    WHERE TRIM("key") = TRIM("id")
-      AND UPPER(TRIM("is_project")) = 'Y'
-      AND NULLIF(TRIM("id"), '') IS NOT NULL
-      AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
+    WHERE entity_id = container_id
+      AND entity_id IS NOT NULL
+      AND UPPER(entity_id) <> 'PLACEHOLDER'
 ),
-task_ids AS (
-    SELECT "parent_task_id"::VARCHAR AS task_id FROM source_data
-    UNION ALL
-    SELECT "child_task_id"::VARCHAR FROM source_data
-    UNION ALL
-    SELECT "grandchild_task_id"::VARCHAR FROM source_data
-    UNION ALL
-    SELECT "baby_task_id"::VARCHAR FROM source_data
-    UNION ALL
-    SELECT "grandbaby_task_id"::VARCHAR FROM source_data
-    UNION ALL
-    SELECT "great_grandbaby_task_id"::VARCHAR FROM source_data
-),
-task_count AS (
+container_counts AS (
     SELECT
-        COUNT(DISTINCT TRIM(task_id))
-            AS snowflake_task_count_including_subtasks
-    FROM task_ids
-    WHERE NULLIF(TRIM(task_id), '') IS NOT NULL
-      AND UPPER(TRIM(task_id)) <> 'PLACEHOLDER'
+        COUNT(DISTINCT container_id)
+            AS all_container_ids_including_folders,
+
+        COUNT(DISTINCT CASE
+            WHEN entity_id = container_id
+             AND project_flag = 'Y'
+            THEN container_id
+        END) AS confirmed_project_ids
+    FROM source_data
+    WHERE container_id IS NOT NULL
+      AND UPPER(container_id) <> 'PLACEHOLDER'
+),
+task_counts AS (
+    SELECT
+        COUNT(DISTINCT s.entity_id) AS task_ids_using_your_key_rule
+    FROM source_data s
+    WHERE s.entity_id IS NOT NULL
+      AND UPPER(s.entity_id) <> 'PLACEHOLDER'
+      AND s.entity_id <> s.container_id
+      AND NOT EXISTS (
+          SELECT 1
+          FROM folder_keys f
+          WHERE f.entity_id = s.entity_id
+      )
 )
 SELECT
-    p.snowflake_project_count,
-    t.snowflake_task_count_including_subtasks
-FROM project_count p
-CROSS JOIN task_count t;
+    c.all_container_ids_including_folders,
+    c.confirmed_project_ids,
+    t.task_ids_using_your_key_rule
+FROM container_counts c
+CROSS JOIN task_counts t;
 
 
 
 
---==================================================================================================================================================
-#!/usr/bin/env python3
-"""Read-only Wrike inventory. Python 3, standard library only.
+--======================
 
-Counts token-visible projects and tasks (including subtasks) across all pages.
-Does not connect to Snowflake or modify the incremental pipeline.
-"""
-import argparse
-import csv
-import getpass
-import json
-import random
-import sys
-import time
-import uuid
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+SELECT
+    TRIM("id") AS container_id,
 
+    MAX(CASE
+        WHEN TRIM("key") = TRIM("id")
+        THEN NULLIF(TRIM("title"), '')
+    END) AS container_name,
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+    CASE
+        WHEN MAX(CASE
+            WHEN TRIM("key") = TRIM("id")
+             AND UPPER(TRIM("is_project")) = 'Y'
+            THEN 1 ELSE 0
+        END) = 1
+        THEN 'CONFIRMED_PROJECT'
+        ELSE 'NOT_CONFIRMED_AS_PROJECT'
+    END AS classification
 
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def retry_delay(value, attempt):
-    if value:
-        try:
-            return max(0, int(value))
-        except ValueError:
-            try:
-                date = parsedate_to_datetime(value)
-                if date.tzinfo is None:
-                    date = date.replace(tzinfo=timezone.utc)
-                return max(0, (date - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                pass
-    return min(120, 5 * 2 ** attempt) + random.random()
-
-
-class Client:
-    def __init__(self, token):
-        self.token = token
-        self.opener = build_opener(NoRedirect())
-
-    def get(self, endpoint, params):
-        url = 'https://www.wrike.com/api/v4/' + endpoint + '?' + urlencode(params)
-        for attempt in range(7):
-            request = Request(url, headers={
-                'Authorization': 'Bearer ' + self.token,
-                'Accept': 'application/json',
-            })
-            try:
-                with self.opener.open(request, timeout=90) as response:
-                    payload = json.load(response)
-                if not isinstance(payload, dict):
-                    raise RuntimeError('Unexpected API response; inventory incomplete.')
-                return payload
-            except HTTPError as exc:
-                code = exc.code
-                retry_after = exc.headers.get('Retry-After') if exc.headers else None
-                exc.close()
-                if code not in (429, 500, 502, 503, 504) or attempt == 6:
-                    raise RuntimeError(
-                        f'Wrike HTTP {code}; inventory incomplete. No complete total produced.'
-                    ) from None
-                delay = retry_delay(retry_after, attempt)
-                reason = f'HTTP {code}'
-            except (URLError, TimeoutError, ConnectionError):
-                if attempt == 6:
-                    raise RuntimeError('Network failure; inventory incomplete.') from None
-                delay = retry_delay(None, attempt)
-                reason = 'Network failure'
-            except (ValueError, UnicodeError):
-                raise RuntimeError('Invalid API JSON; inventory incomplete.') from None
-            if delay > 300:
-                raise RuntimeError(
-                    f'Server requests a {delay:.0f}-second wait. Retry later; inventory incomplete.'
-                )
-            print(f'{reason}: retry {attempt + 1}/6 in {delay:.1f}s.', flush=True)
-            time.sleep(delay)
-
-
-def collect(client, entity, pause=1.0):
-    endpoint = 'folders' if entity == 'projects' else 'tasks'
-    params = {'pageSize': '1000'}
-    if entity == 'projects':
-        params.update(project='true', deleted='false')
-    else:
-        # Account tasks endpoint documents subTasks, but not a deleted filter.
-        # No status/date/title filters: include completed and cancelled tasks too.
-        params['subTasks'] = 'true'
-    rows, seen_tokens = {}, set()
-    pages = duplicates = 0
-    while True:
-        payload = client.get(endpoint, params)
-        if payload.get('kind') != endpoint or not isinstance(payload.get('data'), list):
-            raise RuntimeError(f'Unexpected {entity} response; inventory incomplete.')
-        for item in payload['data']:
-            if not isinstance(item, dict):
-                raise RuntimeError(f'Invalid {entity} record.')
-            entity_id = item.get('id')
-            if not isinstance(entity_id, str) or not entity_id.strip():
-                raise RuntimeError(f'Missing {entity} ID; inventory incomplete.')
-            if entity == 'projects' and not isinstance(item.get('project'), dict):
-                raise RuntimeError('Non-project returned by project filter; investigate before counting.')
-            duplicates += int(entity_id in rows)
-            rows[entity_id] = {
-                'id': entity_id,
-                'name': item.get('title') or '',
-                'account_id': item.get('accountId') or '',
-            }
-        pages += 1
-        print(f'{entity}: page {pages}, {len(rows):,} unique IDs so far.', flush=True)
-        token = payload.get('nextPageToken')
-        if token is None or token == '':
-            return rows, pages, duplicates
-        if not isinstance(token, str) or token in seen_tokens:
-            raise RuntimeError('Invalid/repeated pagination token; inventory incomplete.')
-        seen_tokens.add(token)
-        params['nextPageToken'] = token
-        time.sleep(pause)
-
-
-def spreadsheet_text(value):
-    text = str(value)
-    return "'" + text if text.lstrip().startswith(('=', '+', '-', '@')) else text
-
-
-def save_csv(path, rows, entity):
-    prefix = 'project' if entity == 'projects' else 'task'
-    with path.open('w', encoding='utf-8-sig', newline='') as handle:
-        writer = csv.writer(handle)
-        writer.writerow([prefix + '_id', prefix + '_name', 'account_id'])
-        for key in sorted(rows):
-            row = rows[key]
-            writer.writerow([row['id'], spreadsheet_text(row['name']), row['account_id']])
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--only', choices=['both', 'projects', 'tasks'], default='both')
-    parser.add_argument('--output', default='output/entity_counts', help='Parent output folder')
-    args = parser.parse_args()
-    token = getpass.getpass('Wrike token (hidden; never saved): ').strip()
-    if not token:
-        parser.error('A token is required.')
-    run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ_') + uuid.uuid4().hex[:8]
-    directory = Path(args.output) / run_id
-    directory.mkdir(parents=True, exist_ok=False)
-    summary = {
-        'run_id': run_id, 'started_at': utc_now(), 'status': 'RUNNING',
-        'scope': 'Token-visible current account; no status/date/name filter. '
-                 'Projects exclude recycle bin; tasks include subtasks from /tasks.',
-        'counts': {}, 'details': {},
-        'limitation': 'Pages are collected over time, not an atomic snapshot. '
-                      'Snowflake scope and freshness may differ.',
-    }
-    selected = ['projects', 'tasks'] if args.only == 'both' else [args.only]
-    client = Client(token)
-    result = 0
-    try:
-        for entity in selected:
-            rows, pages, duplicates = collect(client, entity)
-            save_csv(directory / ('wrike_' + entity + '.csv'), rows, entity)
-            summary['counts'][entity] = len(rows)
-            summary['details'][entity] = {
-                'pages': pages, 'duplicate_ids_across_pages': duplicates,
-                'account_ids': sorted({r['account_id'] for r in rows.values() if r['account_id']}),
-                'finished_at': utc_now(),
-            }
-        summary['status'] = 'COMPLETE'
-    except (RuntimeError, OSError, KeyboardInterrupt) as exc:
-        summary['status'] = 'INCOMPLETE'
-        summary['error'] = 'Interrupted.' if isinstance(exc, KeyboardInterrupt) else str(exc)
-        print(summary['error'], file=sys.stderr)
-        result = 1
-    summary['finished_at'] = utc_now()
-    (directory / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
-    if summary['status'] == 'COMPLETE':
-        print('\nCOMPLETE — distinct token-visible IDs:')
-        for entity, count in summary['counts'].items():
-            print(f'  {entity}: {count:,}')
-    else:
-        print('INCOMPLETE — do not treat this run as a complete inventory.', file=sys.stderr)
-    print(f'Output: {directory.resolve()}')
-    return result
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE NULLIF(TRIM("id"), '') IS NOT NULL
+  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
+GROUP BY TRIM("id")
+ORDER BY container_name, container_id;
