@@ -1,1 +1,4 @@
-cd ~/Desktop/wrike_incremental_step1 && \ python3 project_history.py export \ --db output/cohort_01/project_history.sqlite \ --output output/cohort_01/export
+cd ~/Desktop/wrike_incremental_step1 && \
+python3 project_history.py export \
+  --db output/cohort_01/project_history.sqlite \
+  --output output/cohort_01/export
