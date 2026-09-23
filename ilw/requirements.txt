@@ -1,23 +1,8 @@
-ood. First preserve the Akash-token output before doing anything else.
-
-Run:
-
-cp Single_execut.xlsx Single_execut_akash_token.xlsx
-
-Then check how many data rows Akash’s token produced:
-
-python3 -c "import pandas as pd; df=pd.read_excel('Single_execut_akash_token.xlsx'); print(len(df))"
-
-Your earlier your-token run was:
-
-211,575 rows
-
-Send me the Akash-token row count.
-
-Then we’ll compare:
-
-Your token   = 211,575
-Akash token  = ?
-Difference   = ?
-
-If Akash’s token produces noticeably more rows, that’s strong evidence the extraction difference is due to Wrike access/visibility rather than the local extraction logic.
+SELECT
+    "id" AS project_api_id,
+    MAX(CASE WHEN "key" = "id" THEN "title" END) AS project_name
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE NULLIF(TRIM("id"), '') IS NOT NULL
+  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
+GROUP BY "id"
+ORDER BY project_name;
