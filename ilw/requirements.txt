@@ -11,16 +11,37 @@ BASE_DIR = Path(__file__).resolve().parent
 MY_FILE = BASE_DIR / "Single_execut_my_token.xlsx"
 AKASH_FILE = BASE_DIR / "Single_execut_akash_token.xlsx"
 
-PROJECT_NAMES_FILE = BASE_DIR / "project_names.csv"
-
-OUTPUT_FILE = BASE_DIR / "token_project_comparison.xlsx"
+OUTPUT_FILE = BASE_DIR / "SDP.xlsx"
 
 
 # =========================================================
-# CLEANING
+# COLUMNS NEEDED FROM SINGLE_EXECUT
+# =========================================================
+
+REQUIRED_COLUMNS = [
+    "id",
+    "key",
+    "title",
+    "is_project",
+    "parent_folder_id",
+    "parent_folder_title",
+    "child_folder_id",
+    "child_folder_title",
+    "grandchild_folder_id",
+    "grandchild_folder_title",
+    "baby_folder_id",
+    "baby_folder_title",
+    "grandbaby_folder_id",
+    "grandbaby_folder_title",
+]
+
+
+# =========================================================
+# HELPER
 # =========================================================
 
 def clean(value):
+
     if pd.isna(value):
         return ""
 
@@ -39,252 +60,401 @@ def clean(value):
 
 
 # =========================================================
-# LOAD PROJECT IDs FROM EACH TOKEN OUTPUT
+# LOAD PROJECT IDS + PROJECT NAMES
 # =========================================================
 
-def load_project_ids(path):
+def load_projects(path, token_label):
 
-    print(f"\nLoading {path.name} ...")
+    print("\n" + "=" * 70)
+    print(f"Loading {path.name} ...")
+    print("=" * 70)
 
+    if not path.exists():
+        raise FileNotFoundError(
+            f"File not found: {path}"
+        )
+
+    # Only load the columns needed for this comparison.
     df = pd.read_excel(
         path,
         dtype=str,
         engine="openpyxl",
-        usecols=["id", "is_project"]
+        usecols=lambda c: str(c).strip() in REQUIRED_COLUMNS
     ).fillna("")
 
-    df["id"] = df["id"].map(clean)
+    df.columns = [
+        str(c).strip()
+        for c in df.columns
+    ]
+
+    # Required columns must exist.
+    for col in ["id", "key", "title", "is_project"]:
+        if col not in df.columns:
+            raise ValueError(
+                f"Required column '{col}' "
+                f"not found in {path.name}"
+            )
+
+    # Add hierarchy columns if any are absent.
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Clean values.
+    for col in REQUIRED_COLUMNS:
+        df[col] = df[col].map(clean)
 
     df["is_project"] = (
         df["is_project"]
-        .map(clean)
         .str.upper()
     )
 
-    projects = df[
+    # =====================================================
+    # STEP 1
+    # IDENTIFY EVERY PROJECT ID VISIBLE TO THIS TOKEN
+    # =====================================================
+
+    project_rows = df[
         (df["is_project"] == "Y")
         & (df["id"] != "")
         & (df["id"].str.upper() != "PLACEHOLDER")
-    ]
+    ].copy()
 
     project_ids = sorted(
-        set(projects["id"])
+        project_rows["id"].unique()
     )
 
     print(
-        f"Unique project IDs: "
+        f"{token_label} unique project IDs: "
         f"{len(project_ids):,}"
     )
 
-    return project_ids
+    # =====================================================
+    # STEP 2
+    # GET PROJECT NAMES FROM ACTUAL PROJECT ROWS
+    #
+    # Real project/folder row:
+    #     id  = project id
+    #     key = project id
+    #     title = project name
+    #
+    # Task rows:
+    #     id  = folder/project id
+    #     key = task id
+    # =====================================================
 
+    actual_project_rows = df[
+        (df["is_project"] == "Y")
+        & (df["id"] != "")
+        & (df["id"].str.upper() != "PLACEHOLDER")
+        & (df["id"] == df["key"])
+        & (df["title"] != "")
+    ].copy()
 
-# =========================================================
-# LOAD PROJECT ID -> NAME LOOKUP
-# =========================================================
+    name_lookup = {}
 
-def load_project_names():
+    # If a project appears multiple times, keep the first valid
+    # project name for that ID.
+    for _, row in actual_project_rows.iterrows():
 
-    print(
-        f"\nLoading project names from "
-        f"{PROJECT_NAMES_FILE.name} ..."
-    )
+        project_id = clean(row["id"])
+        project_name = clean(row["title"])
 
-    names = pd.read_csv(
-        PROJECT_NAMES_FILE,
-        dtype=str
-    ).fillna("")
+        if (
+            project_id
+            and project_name
+            and project_id not in name_lookup
+        ):
+            name_lookup[project_id] = project_name
 
-    names.columns = [
-        str(c).strip()
-        for c in names.columns
+    # =====================================================
+    # STEP 3
+    # FALLBACK TO FOLDER HIERARCHY FOR ANY PROJECT
+    # WHOSE NAME WAS NOT FOUND ABOVE
+    # =====================================================
+
+    hierarchy_levels = [
+        (
+            "parent_folder_id",
+            "parent_folder_title"
+        ),
+        (
+            "child_folder_id",
+            "child_folder_title"
+        ),
+        (
+            "grandchild_folder_id",
+            "grandchild_folder_title"
+        ),
+        (
+            "baby_folder_id",
+            "baby_folder_title"
+        ),
+        (
+            "grandbaby_folder_id",
+            "grandbaby_folder_title"
+        ),
     ]
 
-    required = {
-        "project_api_id",
-        "project_name"
-    }
+    missing_ids = set(
+        project_id
+        for project_id in project_ids
+        if project_id not in name_lookup
+    )
 
-    missing = required - set(names.columns)
+    for id_col, title_col in hierarchy_levels:
 
-    if missing:
-        raise ValueError(
-            "project_names.csv is missing columns: "
-            f"{sorted(missing)}"
+        if not missing_ids:
+            break
+
+        matching_rows = df[
+            df[id_col].isin(missing_ids)
+            & (df[title_col] != "")
+        ][
+            [
+                id_col,
+                title_col
+            ]
+        ].drop_duplicates()
+
+        for _, row in matching_rows.iterrows():
+
+            project_id = clean(
+                row[id_col]
+            )
+
+            project_name = clean(
+                row[title_col]
+            )
+
+            if (
+                project_id
+                and project_name
+                and project_id not in name_lookup
+            ):
+                name_lookup[
+                    project_id
+                ] = project_name
+
+        missing_ids = set(
+            project_id
+            for project_id in project_ids
+            if project_id not in name_lookup
         )
 
-    names["project_api_id"] = (
-        names["project_api_id"]
-        .map(clean)
-    )
+    # =====================================================
+    # STEP 4
+    # BUILD FINAL PROJECT ID / NAME TABLE
+    # =====================================================
 
-    names["project_name"] = (
-        names["project_name"]
-        .map(clean)
-    )
-
-    names = names[
-        names["project_api_id"] != ""
-    ]
-
-    names = names.drop_duplicates(
-        subset=["project_api_id"]
-    )
-
-    lookup = dict(
-        zip(
-            names["project_api_id"],
-            names["project_name"]
-        )
-    )
-
-    print(
-        f"Project names loaded: "
-        f"{len(lookup):,}"
-    )
-
-    return lookup
-
-
-# =========================================================
-# LOAD DATA
-# =========================================================
-
-my_ids = load_project_ids(MY_FILE)
-
-akash_ids = load_project_ids(AKASH_FILE)
-
-name_lookup = load_project_names()
-
-
-# =========================================================
-# COMPARE PROJECT IDs
-# =========================================================
-
-my_set = set(my_ids)
-
-akash_set = set(akash_ids)
-
-common_ids = my_set & akash_set
-
-only_my_ids = sorted(
-    my_set - akash_set
-)
-
-only_akash_ids = sorted(
-    akash_set - my_set
-)
-
-
-# =========================================================
-# CREATE ID + NAME PAIRS
-# =========================================================
-
-def make_project_list(project_ids):
-
-    rows = []
+    records = []
 
     for project_id in project_ids:
 
-        project_name = name_lookup.get(
-            project_id,
-            "[NAME NOT FOUND]"
-        )
-
-        rows.append(
+        records.append(
             {
                 "project_id": project_id,
-                "project_name": project_name
+                "project_name": name_lookup.get(
+                    project_id,
+                    "[NAME NOT FOUND]"
+                )
             }
         )
 
-    # Sort by project name
-    rows = sorted(
-        rows,
-        key=lambda x: (
-            x["project_name"].lower(),
-            x["project_id"]
-        )
+    projects = pd.DataFrame(
+        records
     )
 
-    return rows
+    projects = (
+        projects
+        .sort_values(
+            [
+                "project_name",
+                "project_id"
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    missing_name_count = int(
+        (
+            projects["project_name"]
+            == "[NAME NOT FOUND]"
+        ).sum()
+    )
+
+    print(
+        f"{token_label} projects with names: "
+        f"{len(projects) - missing_name_count:,}"
+    )
+
+    print(
+        f"{token_label} names not found: "
+        f"{missing_name_count:,}"
+    )
+
+    return projects
 
 
-my_projects = make_project_list(
-    my_ids
+# =========================================================
+# LOAD BOTH TOKEN OUTPUTS
+# =========================================================
+
+my_projects = load_projects(
+    MY_FILE,
+    "MY TOKEN"
 )
 
-akash_projects = make_project_list(
-    akash_ids
-)
-
-only_my_projects = make_project_list(
-    only_my_ids
-)
-
-only_akash_projects = make_project_list(
-    only_akash_ids
+akash_projects = load_projects(
+    AKASH_FILE,
+    "AKASH TOKEN"
 )
 
 
 # =========================================================
-# BUILD SINGLE EXCEL TABLE
+# CREATE PROJECT ID SETS
+# =========================================================
+
+my_ids = set(
+    my_projects["project_id"]
+)
+
+akash_ids = set(
+    akash_projects["project_id"]
+)
+
+common_ids = (
+    my_ids
+    & akash_ids
+)
+
+only_my_ids = (
+    my_ids
+    - akash_ids
+)
+
+only_akash_ids = (
+    akash_ids
+    - my_ids
+)
+
+
+# =========================================================
+# FILTER UNIQUE PROJECTS
+# =========================================================
+
+only_my_projects = (
+    my_projects[
+        my_projects[
+            "project_id"
+        ].isin(
+            only_my_ids
+        )
+    ]
+    .copy()
+    .sort_values(
+        [
+            "project_name",
+            "project_id"
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+
+only_akash_projects = (
+    akash_projects[
+        akash_projects[
+            "project_id"
+        ].isin(
+            only_akash_ids
+        )
+    ]
+    .copy()
+    .sort_values(
+        [
+            "project_name",
+            "project_id"
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+
+# =========================================================
+# CREATE EXACT 8-COLUMN OUTPUT
 # =========================================================
 
 output = pd.DataFrame({
 
-    "my_token_project_id":
-        pd.Series([
-            x["project_id"]
-            for x in my_projects
-        ]),
+    # 1
+    "my_token_project_ids":
+        pd.Series(
+            my_projects[
+                "project_id"
+            ].tolist()
+        ),
 
-    "my_token_project_name":
-        pd.Series([
-            x["project_name"]
-            for x in my_projects
-        ]),
+    # 2
+    "my_token_project_names":
+        pd.Series(
+            my_projects[
+                "project_name"
+            ].tolist()
+        ),
 
-    "akash_token_project_id":
-        pd.Series([
-            x["project_id"]
-            for x in akash_projects
-        ]),
+    # 3
+    "akash_token_project_ids":
+        pd.Series(
+            akash_projects[
+                "project_id"
+            ].tolist()
+        ),
 
-    "akash_token_project_name":
-        pd.Series([
-            x["project_name"]
-            for x in akash_projects
-        ]),
+    # 4
+    "akash_token_project_names":
+        pd.Series(
+            akash_projects[
+                "project_name"
+            ].tolist()
+        ),
 
-    "only_my_token_project_id":
-        pd.Series([
-            x["project_id"]
-            for x in only_my_projects
-        ]),
+    # 5
+    "project_ids_only_in_my_token":
+        pd.Series(
+            only_my_projects[
+                "project_id"
+            ].tolist()
+        ),
 
-    "only_my_token_project_name":
-        pd.Series([
-            x["project_name"]
-            for x in only_my_projects
-        ]),
+    # 6
+    "project_names_only_in_my_token":
+        pd.Series(
+            only_my_projects[
+                "project_name"
+            ].tolist()
+        ),
 
-    "only_akash_token_project_id":
-        pd.Series([
-            x["project_id"]
-            for x in only_akash_projects
-        ]),
+    # 7
+    "project_ids_only_in_akash_token":
+        pd.Series(
+            only_akash_projects[
+                "project_id"
+            ].tolist()
+        ),
 
-    "only_akash_token_project_name":
-        pd.Series([
-            x["project_name"]
-            for x in only_akash_projects
-        ]),
+    # 8
+    "project_names_only_in_akash_token":
+        pd.Series(
+            only_akash_projects[
+                "project_name"
+            ].tolist()
+        ),
 })
 
 
 # =========================================================
-# SAVE EXCEL
+# SAVE SDP.XLSX
 # =========================================================
 
 output.to_excel(
@@ -303,51 +473,57 @@ print("PROJECT TOKEN COMPARISON")
 print("=" * 70)
 
 print(
-    f"My token projects       : "
+    f"My token project IDs        : "
     f"{len(my_ids):,}"
 )
 
 print(
-    f"Akash token projects    : "
+    f"Akash token project IDs     : "
     f"{len(akash_ids):,}"
 )
 
 print(
-    f"Common projects         : "
+    f"Common project IDs          : "
     f"{len(common_ids):,}"
 )
 
 print(
-    f"Only in my token        : "
+    f"Only in my token            : "
     f"{len(only_my_ids):,}"
 )
 
 print(
-    f"Only in Akash token     : "
+    f"Only in Akash token         : "
     f"{len(only_akash_ids):,}"
 )
 
-my_missing_names = sum(
-    1
-    for x in my_projects
-    if x["project_name"] == "[NAME NOT FOUND]"
-)
-
-akash_missing_names = sum(
-    1
-    for x in akash_projects
-    if x["project_name"] == "[NAME NOT FOUND]"
+print(
+    "\nExpected from previous comparison:"
 )
 
 print(
-    f"My IDs without names    : "
-    f"{my_missing_names:,}"
+    "My token        : 2,292"
 )
 
 print(
-    f"Akash IDs without names : "
-    f"{akash_missing_names:,}"
+    "Akash token     : 2,235"
+)
+
+print(
+    "Common          : 2,231"
+)
+
+print(
+    "Only mine       : 61"
+)
+
+print(
+    "Only Akash      : 4"
 )
 
 print("\nComparison complete.")
-print(f"Excel created: {OUTPUT_FILE}")
+
+print(
+    f"Excel created: "
+    f"{OUTPUT_FILE}"
+)
