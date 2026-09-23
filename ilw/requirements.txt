@@ -1,12 +1,140 @@
-SELECT
-    "id" AS project_api_id,
-    MAX(CASE WHEN "key" = 'id' THEN "title" END) AS project_name
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("id"), '') IS NOT NULL
-  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-GROUP BY "id"
-HAVING NULLIF(
-    TRIM(MAX(CASE WHEN "key" = 'id' THEN "title" END)),
-    ''
-) IS NOT NULL
-ORDER BY project_name;
+compare_token_project_ids.py
+
+from pathlib import Path
+import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MY_FILE = BASE_DIR / "Single_execut_my_token.xlsx"
+AKASH_FILE = BASE_DIR / "Single_execut_akash_token.xlsx"
+
+OUTPUT_FILE = BASE_DIR / "token_project_id_comparison.xlsx"
+
+
+def load_project_ids(path):
+    print(f"\nLoading {path.name} ...")
+
+    df = pd.read_excel(
+        path,
+        dtype=str,
+        engine="openpyxl"
+    ).fillna("")
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Clean important fields
+    df["id"] = df["id"].astype(str).str.strip()
+    df["is_project"] = df["is_project"].astype(str).str.strip().str.upper()
+
+    # Keep only actual Wrike projects
+    projects = df[
+        (df["is_project"] == "Y")
+        & (df["id"] != "")
+        & (df["id"].str.upper() != "PLACEHOLDER")
+    ].copy()
+
+    project_ids = set(projects["id"].unique())
+
+    print(f"Total rows in file     : {len(df):,}")
+    print(f"Unique project IDs     : {len(project_ids):,}")
+
+    return project_ids
+
+
+# ---------------------------------------------------------
+# LOAD BOTH FILES
+# ---------------------------------------------------------
+
+my_ids = load_project_ids(MY_FILE)
+akash_ids = load_project_ids(AKASH_FILE)
+
+
+# ---------------------------------------------------------
+# COMPARE
+# ---------------------------------------------------------
+
+common_ids = sorted(my_ids & akash_ids)
+
+only_my_ids = sorted(my_ids - akash_ids)
+
+only_akash_ids = sorted(akash_ids - my_ids)
+
+
+# ---------------------------------------------------------
+# PRINT RESULTS
+# ---------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("PROJECT ID COMPARISON")
+print("=" * 60)
+
+print(f"My token project IDs       : {len(my_ids):,}")
+print(f"Akash token project IDs    : {len(akash_ids):,}")
+print(f"Common project IDs         : {len(common_ids):,}")
+print(f"Only in my token           : {len(only_my_ids):,}")
+print(f"Only in Akash token        : {len(only_akash_ids):,}")
+
+
+# ---------------------------------------------------------
+# SAVE REPORT
+# ---------------------------------------------------------
+
+summary = pd.DataFrame([
+    {
+        "metric": "My token project IDs",
+        "count": len(my_ids)
+    },
+    {
+        "metric": "Akash token project IDs",
+        "count": len(akash_ids)
+    },
+    {
+        "metric": "Common project IDs",
+        "count": len(common_ids)
+    },
+    {
+        "metric": "Only in my token",
+        "count": len(only_my_ids)
+    },
+    {
+        "metric": "Only in Akash token",
+        "count": len(only_akash_ids)
+    }
+])
+
+
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+
+    summary.to_excel(
+        writer,
+        sheet_name="Summary",
+        index=False
+    )
+
+    pd.DataFrame({
+        "project_id": common_ids
+    }).to_excel(
+        writer,
+        sheet_name="Common_Projects",
+        index=False
+    )
+
+    pd.DataFrame({
+        "project_id": only_my_ids
+    }).to_excel(
+        writer,
+        sheet_name="Only_My_Token",
+        index=False
+    )
+
+    pd.DataFrame({
+        "project_id": only_akash_ids
+    }).to_excel(
+        writer,
+        sheet_name="Only_Akash_Token",
+        index=False
+    )
+
+
+print("\nComparison complete.")
+print(f"Report created: {OUTPUT_FILE}")
