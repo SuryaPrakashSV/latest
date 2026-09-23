@@ -1,11 +1,12 @@
-SELECT
-    "id" AS project_id,
-    MAX(TRIM("title")) AS project_name
+SELECT "is_project", COUNT(*) AS rows, COUNT(DISTINCT "id") AS distinct_ids
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "key" = "id"
+GROUP BY "is_project";
+
+
+
+SELECT DISTINCT "id" AS project_id, "title" AS project_name
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE "is_project" = TRUE
   AND NULLIF(TRIM("id"), '') IS NOT NULL
   AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-  AND NULLIF(TRIM("title"), '') IS NOT NULL
-GROUP BY "id"
-HAVING UPPER(TRIM("id")) = 'NULL'
-    OR COUNT_IF(UPPER(TRIM("title")) <> 'NULL') = 0;
+ORDER BY project_name;
