@@ -15,40 +15,10 @@ OUTPUT_FILE = BASE_DIR / "token_project_comparison_with_names.xlsx"
 
 
 # =========================================================
-# PROJECT HIERARCHY
-# =========================================================
-
-FOLDER_LEVELS = [
-    ("parent_folder_id", "parent_folder_title"),
-    ("child_folder_id", "child_folder_title"),
-    ("grandchild_folder_id", "grandchild_folder_title"),
-    ("baby_folder_id", "baby_folder_title"),
-    ("grandbaby_folder_id", "grandbaby_folder_title"),
-]
-
-NEEDED_COLUMNS = [
-    "id",
-    "is_project",
-    "title",
-    "parent_folder_id",
-    "parent_folder_title",
-    "child_folder_id",
-    "child_folder_title",
-    "grandchild_folder_id",
-    "grandchild_folder_title",
-    "baby_folder_id",
-    "baby_folder_title",
-    "grandbaby_folder_id",
-    "grandbaby_folder_title",
-]
-
-
-# =========================================================
 # HELPERS
 # =========================================================
 
 def clean(value):
-    """Convert values to clean strings."""
     if pd.isna(value):
         return ""
 
@@ -66,73 +36,20 @@ def clean(value):
     return value
 
 
-def get_project_name(row):
-    """
-    Find the project name by matching the row's current folder/project ID
-    against the hierarchy ID columns.
-    """
+def load_projects(path, token_name):
 
-    project_id = clean(row["id"])
+    print(f"\nLoading {path.name} ...")
 
-    for id_col, title_col in FOLDER_LEVELS:
-
-        folder_id = clean(row[id_col])
-
-        if folder_id == project_id:
-
-            project_name = clean(row[title_col])
-
-            if project_name:
-                return project_name
-
-    # Fallback only if hierarchy matching did not find the name.
-    return clean(row.get("title", ""))
-
-
-def choose_name(values):
-    """
-    If one project ID appears on many rows, select its most common
-    non-empty project name.
-    """
-
-    values = [
-        clean(v)
-        for v in values
-        if clean(v)
-    ]
-
-    if not values:
-        return ""
-
-    series = pd.Series(values)
-
-    return series.value_counts().index[0]
-
-
-def name_variants(values):
-    """Show all distinct names found for the same project ID."""
-
-    values = sorted({
-        clean(v)
-        for v in values
-        if clean(v)
-    })
-
-    return " | ".join(values)
-
-
-def load_projects(path, token_label):
-
-    print("\n" + "=" * 70)
-    print(f"Loading {path.name}")
-    print("=" * 70)
-
-    # Read only the columns needed for project comparison.
     df = pd.read_excel(
         path,
         dtype=str,
         engine="openpyxl",
-        usecols=lambda c: str(c).strip() in NEEDED_COLUMNS
+        usecols=lambda c: str(c).strip() in {
+            "id",
+            "key",
+            "title",
+            "is_project"
+        }
     ).fillna("")
 
     df.columns = [
@@ -140,103 +57,80 @@ def load_projects(path, token_label):
         for c in df.columns
     ]
 
-    # Make sure required columns exist.
-    required = {
-        "id",
-        "is_project"
-    }
-
-    missing = required - set(df.columns)
-
-    if missing:
-        raise ValueError(
-            f"Missing required columns in {path.name}: "
-            f"{sorted(missing)}"
-        )
-
-    # Add any hierarchy columns that are missing.
-    for col in NEEDED_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-
-    # Clean project fields.
-    df["id"] = df["id"].map(clean)
+    for col in ["id", "key", "title", "is_project"]:
+        df[col] = df[col].map(clean)
 
     df["is_project"] = (
         df["is_project"]
-        .map(clean)
         .str.upper()
     )
 
-    # Keep only actual projects.
-    project_rows = df[
+    # -----------------------------------------------------
+    # KEEP ONLY THE ACTUAL PROJECT/FOLDER ROW
+    #
+    # Project row:
+    #     id  = project ID
+    #     key = project ID
+    #     title = project name
+    #
+    # Task row:
+    #     id  = project/folder ID
+    #     key = task ID
+    # -----------------------------------------------------
+
+    projects = df[
         (df["is_project"] == "Y")
         & (df["id"] != "")
         & (df["id"].str.upper() != "PLACEHOLDER")
+        & (df["key"] == df["id"])
+        & (df["title"] != "")
     ].copy()
 
-    # Determine project name.
-    project_rows["project_name"] = project_rows.apply(
-        get_project_name,
-        axis=1
-    )
-
-    # Collapse many rows belonging to one project into one project record.
     projects = (
-        project_rows
-        .groupby("id", as_index=False)
-        .agg(
-            project_name=(
-                "project_name",
-                choose_name
-            ),
-            name_variants=(
-                "project_name",
-                name_variants
-            ),
-            source_row_count=(
+        projects[
+            [
                 "id",
-                "size"
-            )
-        )
+                "title"
+            ]
+        ]
+        .drop_duplicates()
         .rename(
             columns={
-                "id": "project_id"
+                "id": "project_id",
+                "title": "project_name"
             }
         )
     )
 
-    projects["project_name"] = (
-        projects["project_name"]
-        .replace("", "[NAME NOT FOUND]")
+    # If same project appears multiple times because of owners,
+    # keep one ID/name combination.
+    projects = (
+        projects
+        .drop_duplicates(
+            subset=["project_id"]
+        )
+        .sort_values(
+            ["project_name", "project_id"]
+        )
+        .reset_index(drop=True)
     )
 
     projects.insert(
         0,
         "token_source",
-        token_label
+        token_name
     )
 
-    projects = projects.sort_values(
-        ["project_name", "project_id"]
-    ).reset_index(drop=True)
-
-    print(f"Total rows read       : {len(df):,}")
-    print(f"Project rows found    : {len(project_rows):,}")
-    print(f"Unique project IDs    : {len(projects):,}")
-
-    missing_names = (
-        projects["project_name"]
-        == "[NAME NOT FOUND]"
-    ).sum()
-
-    print(f"Projects without name : {missing_names:,}")
+    print(
+        f"Unique projects with names: "
+        f"{len(projects):,}"
+    )
 
     return projects
 
 
 # =========================================================
-# LOAD BOTH TOKEN OUTPUTS
+# LOAD BOTH FILES
 # =========================================================
 
 my_projects = load_projects(
@@ -263,12 +157,14 @@ akash_ids = set(
 )
 
 common_ids = my_ids & akash_ids
+
 only_my_ids = my_ids - akash_ids
+
 only_akash_ids = akash_ids - my_ids
 
 
 # =========================================================
-# ONLY MY TOKEN
+# MY TOKEN ONLY
 # =========================================================
 
 only_my = (
@@ -278,15 +174,12 @@ only_my = (
         )
     ]
     .copy()
-    .sort_values(
-        ["project_name", "project_id"]
-    )
     .reset_index(drop=True)
 )
 
 
 # =========================================================
-# ONLY AKASH TOKEN
+# AKASH TOKEN ONLY
 # =========================================================
 
 only_akash = (
@@ -296,9 +189,6 @@ only_akash = (
         )
     ]
     .copy()
-    .sort_values(
-        ["project_name", "project_id"]
-    )
     .reset_index(drop=True)
 )
 
@@ -315,8 +205,7 @@ common = (
     ][
         [
             "project_id",
-            "project_name",
-            "source_row_count"
+            "project_name"
         ]
     ]
     .merge(
@@ -327,8 +216,7 @@ common = (
         ][
             [
                 "project_id",
-                "project_name",
-                "source_row_count"
+                "project_name"
             ]
         ],
         on="project_id",
@@ -345,18 +233,6 @@ common["project_name_match"] = (
     == common["project_name_akash_token"]
 )
 
-common["row_count_difference"] = (
-    common["source_row_count_my_token"]
-    - common["source_row_count_akash_token"]
-)
-
-common = common.sort_values(
-    [
-        "project_name_my_token",
-        "project_id"
-    ]
-).reset_index(drop=True)
-
 
 # =========================================================
 # SUMMARY
@@ -365,37 +241,31 @@ common = common.sort_values(
 summary = pd.DataFrame(
     [
         {
-            "metric": "My token unique projects",
+            "metric": "My token projects",
             "count": len(my_projects)
         },
         {
-            "metric": "Akash token unique projects",
+            "metric": "Akash token projects",
             "count": len(akash_projects)
         },
         {
             "metric": "Common projects",
-            "count": len(common_ids)
+            "count": len(common)
         },
         {
             "metric": "Only my token",
-            "count": len(only_my_ids)
+            "count": len(only_my)
         },
         {
             "metric": "Only Akash token",
-            "count": len(only_akash_ids)
-        },
-        {
-            "metric": "Common IDs with different project names",
-            "count": int(
-                (~common["project_name_match"]).sum()
-            )
+            "count": len(only_akash)
         },
     ]
 )
 
 
 # =========================================================
-# TERMINAL SUMMARY
+# TERMINAL RESULTS
 # =========================================================
 
 print("\n" + "=" * 70)
@@ -414,27 +284,22 @@ print(
 
 print(
     f"Common projects         : "
-    f"{len(common_ids):,}"
+    f"{len(common):,}"
 )
 
 print(
     f"Only in my token        : "
-    f"{len(only_my_ids):,}"
+    f"{len(only_my):,}"
 )
 
 print(
     f"Only in Akash token     : "
-    f"{len(only_akash_ids):,}"
-)
-
-print(
-    f"Common name mismatches  : "
-    f"{(~common['project_name_match']).sum():,}"
+    f"{len(only_akash):,}"
 )
 
 
 # =========================================================
-# WRITE EXCEL REPORT
+# EXCEL OUTPUT
 # =========================================================
 
 with pd.ExcelWriter(
