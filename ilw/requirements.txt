@@ -1,17 +1,44 @@
-SELECT
-    "id" AS entity_id,
-    MAX(TRIM("title")) AS entity_name
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "key" = "id"
-  AND NULLIF(TRIM("id"), '') IS NOT NULL
-  AND UPPER(TRIM("id")) NOT IN ('PLACEHOLDER', 'NULL')
-  AND NULLIF(TRIM("title"), '') IS NOT NULL
-  AND UPPER(TRIM("title")) <> 'NULL'
-GROUP BY "id"
-HAVING MAX(
-    CASE
-        WHEN UPPER(TRIM("is_project"::VARCHAR)) = 'Y'
-        THEN 1 ELSE 0
-    END
-) = 0
-ORDER BY entity_name, entity_id;
+cd ~/Desktop/wrike_incremental_step1 && python3 - <<'PY'
+import csv
+import subprocess
+import sys
+
+with open("projects_snowflake.csv", encoding="utf-8-sig", newline="") as f:
+    rows = list(csv.DictReader(f))
+
+selections = [
+    ("Diwali FY27",),
+    ("Japan New Year", "JNY (FY27)"),
+    ("Tmall", "CNY", "Core-Publishing (Planning)"),
+]
+
+ids = []
+for parts in selections:
+    matches = [
+        row for row in rows
+        if all(part in (row.get("PROJECT_NAME") or "") for part in parts)
+    ]
+    if len(matches) != 1:
+        sys.exit(f"STOP: Found {len(matches)} matches for {parts}. Share this output.")
+
+    row = matches[0]
+    project_id = (row.get("PROJECT_ID") or "").strip()
+    if not project_id:
+        sys.exit(f"STOP: Missing project ID for {parts}.")
+
+    ids.append(project_id)
+    print(row["PROJECT_NAME"], "->", project_id, flush=True)
+
+if len(set(ids)) != 3:
+    sys.exit("STOP: The selected project IDs are not unique.")
+
+command = [
+    sys.executable, "project_history.py", "capture",
+    "--db", "output/cohort_01/project_history.sqlite",
+    "--output", "output/cohort_01/runs",
+]
+for project_id in ids:
+    command.extend(["--project-id", project_id])
+
+sys.exit(subprocess.call(command))
+PY
