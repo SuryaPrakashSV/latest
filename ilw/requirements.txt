@@ -1,27 +1,6 @@
-# ==================== LOCAL CSV EXPORT ====================
-from pathlib import Path
-from datetime import datetime, timezone
+from getpass import getpass
 
-if df_final_complete.empty:
-    raise RuntimeError("No rows extracted. Cannot validate this run.")
+TOKEN = getpass("Wrike token for local validation (hidden): ").strip()
 
-run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-
-output_dir = (
-    Path(__file__).resolve().parent
-    / "output"
-    / "local_validation"
-    / run_id
-)
-output_dir.mkdir(parents=True, exist_ok=False)
-
-output_file = output_dir / "wrike_local_full.csv"
-
-df_final_complete.to_csv(
-    output_file,
-    index=False,
-    encoding="utf-8-sig",
-)
-
-print(f"Saved: {output_file}")
-print(f"Dataset rows exported: {len(df_final_complete):,}")
+if not TOKEN:
+    raise RuntimeError("Wrike token cannot be empty.")
