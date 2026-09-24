@@ -1,29 +1,20 @@
-SELECT
-    TRIM("id") AS project_id,
+cd ~/Desktop/wrike-local-baseline && python3 - <<'PY'
+import csv
 
-    MAX(
-        CASE
-            WHEN TRIM("key") = TRIM("id")
-            THEN NULLIF(TRIM("title"), '')
-        END
-    ) AS project_name,
+with open("akash_reference.csv", encoding="utf-8-sig", newline="") as f:
+    reader = csv.DictReader(f)
+    reader.fieldnames = [
+        name.strip().lower() for name in (reader.fieldnames or [])
+    ]
+    if "id" not in reader.fieldnames:
+        raise SystemExit("Missing id column. Found: " + str(reader.fieldnames))
+    rows = list(reader)
 
-    MAX(
-        CASE
-            WHEN TRIM("key") = TRIM("id")
-             AND UPPER(TRIM("is_project")) = 'Y'
-            THEN 1
-            ELSE 0
-        END
-    ) AS is_confirmed_project,
+ids = [(row.get("id") or "").strip() for row in rows]
+valid_ids = [value for value in ids if value]
 
-    CURRENT_TIMESTAMP() AS exported_at
-
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-
-WHERE NULLIF(TRIM("id"), '') IS NOT NULL
-  AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
-
-GROUP BY TRIM("id")
-
-ORDER BY project_name, project_id;
+print("Data rows:", len(rows))
+print("Unique IDs:", len(set(valid_ids)))
+print("Blank ID rows:", len(rows) - len(valid_ids))
+print("Repeated ID rows:", len(valid_ids) - len(set(valid_ids)))
+PY
