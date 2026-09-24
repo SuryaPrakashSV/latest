@@ -14,3 +14,60 @@ WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
       OR COLUMN_NAME ILIKE '%time_spent%'
   )
 ORDER BY ORDINAL_POSITION;
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+WITH targets AS (
+    SELECT column1 AS container_name
+    FROM VALUES
+        ('Test Import'),
+        ('Intake Form - Resourcing Template'),
+        ('NPI Project Blueprints'),
+        ('xxOLD Blueprints')
+),
+containers AS (
+    SELECT DISTINCT
+        t.container_name,
+        w."id" AS container_id
+    FROM targets t
+    LEFT JOIN
+        GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
+        ON TRIM(w."title") = t.container_name
+       AND w."key" = w."id"
+)
+SELECT DISTINCT
+    c.container_name,
+    c.container_id,
+    w."key"   AS entity_id,
+    w."title" AS entity_title,
+
+    CASE
+        WHEN c.container_id IS NULL THEN 'CONTAINER_NOT_FOUND'
+        WHEN w."key" = w."id" THEN 'CONTAINER_OWN_ROW'
+        ELSE 'ASSOCIATED_ROW'
+    END AS row_kind,
+
+    w."effortAllocation_mode",
+    w."effortAllocation_totalEffort",
+    w."effortAllocation_allocatedEffort",
+    w."totalEffortMinutes",
+    w."owner_effortMinutes_per_day",
+
+    w."effort [days]",
+    w."total hours",
+    w."allocated hours",
+    w."booked effort",
+    w."forecasted hours",
+    w."[xa] effort h/d",
+    w."[xa] effort total p/d",
+    w."[xa] mission control effort"
+
+FROM containers c
+LEFT JOIN
+    GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
+    ON w."id" = c.container_id
+
+ORDER BY
+    container_name,
+    entity_id;
