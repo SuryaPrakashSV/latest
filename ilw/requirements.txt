@@ -1,20 +1,269 @@
-cd ~/Desktop/wrike-local-baseline && python3 - <<'PY'
+#!/usr/bin/env python3
+"""Check saved Snowflake/reference CSVs, then compare a completed local extract.
+
+Run from Desktop/wrike-local-baseline:
+    python3 validate_local_baseline.py --check-inputs
+    python3 validate_local_baseline.py --local output/local_validation/RUN/wrike_local_full.csv
+
+Python standard library only. No imports of the extraction script, credentials,
+network requests, or changes to the input files. Wait for the extraction's
+"Saved:" message before supplying --local; a partially written CSV is not valid.
+
+Identity rules mirror the supplied Snowflake query:
+  * Distinct stripped id values; exclude blanks and PLACEHOLDER only.
+  * A container's own row has stripped key == stripped id.
+  * Names and project flags come ONLY from own rows.
+  * A project is confirmed when any own row has is_project == Y (case-insensitive).
+  * Keep unnamed IDs. Keep ID case. Do not match by name or permalink.
+
+Exit codes: 0 input check passed / ID sets match; 2 ID sets differ; 1 input/error.
+ID equality alone does not verify API completeness, tokens, task counts, status
+history, or all data columns. Review the extraction log separately.
+"""
+
+import argparse
 import csv
+import hashlib
+import json
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
-with open("akash_reference.csv", encoding="utf-8-sig", newline="") as f:
-    reader = csv.DictReader(f)
-    reader.fieldnames = [
-        name.strip().lower() for name in (reader.fieldnames or [])
-    ]
-    if "id" not in reader.fieldnames:
-        raise SystemExit("Missing id column. Found: " + str(reader.fieldnames))
-    rows = list(reader)
 
-ids = [(row.get("id") or "").strip() for row in rows]
-valid_ids = [value for value in ids if value]
+csv.field_size_limit(16 * 1024 * 1024)
 
-print("Data rows:", len(rows))
-print("Unique IDs:", len(set(valid_ids)))
-print("Blank ID rows:", len(rows) - len(valid_ids))
-print("Repeated ID rows:", len(valid_ids) - len(set(valid_ids)))
-PY
+
+def valid_id(value):
+    return bool(value) and value.upper() != "PLACEHOLDER"
+
+
+def fingerprint(path):
+    info = path.stat()
+    return (info.st_size, info.st_mtime_ns, info.st_ino)
+
+
+def file_audit(path, before, row_count):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if fingerprint(path) != before:
+        raise ValueError("Input changed while reading: " + str(path))
+    return {
+        "path": str(path.resolve()),
+        "sha256": digest.hexdigest(),
+        "bytes": before[0],
+        "data_rows": row_count,
+    }
+
+
+def read_rows(path, required):
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        headers = reader.fieldnames
+        if not headers:
+            raise ValueError(str(path) + ": empty CSV / missing header")
+        normalized = [name.strip().lower() for name in headers]
+        if len(set(normalized)) != len(normalized) or "" in normalized:
+            raise ValueError(str(path) + ": blank or duplicate column headers")
+        missing = set(required) - set(normalized)
+        if missing:
+            raise ValueError(str(path) + ": missing columns " + ", ".join(sorted(missing)))
+        reader.fieldnames = normalized
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(str(path) + ": malformed CSV at line " + str(reader.line_num))
+            yield row
+
+
+def load_inventory(path, reference=False):
+    before = fingerprint(path)
+    required = ("id", "title") if reference else (
+        "project_id", "project_name", "is_confirmed_project"
+    )
+    id_column, name_column = required[:2]
+    records = {}
+    rows = 0
+    exported_at = set()
+    for row in read_rows(path, required):
+        rows += 1
+        entity_id = row[id_column].strip()
+        if not valid_id(entity_id):
+            raise ValueError(str(path) + ": blank/PLACEHOLDER ID at data row " + str(rows))
+        if entity_id in records:
+            raise ValueError(str(path) + ": repeated ID " + entity_id)
+        flag = None
+        if not reference:
+            flag_text = row["is_confirmed_project"].strip()
+            if flag_text not in ("0", "1", "0.0", "1.0"):
+                raise ValueError(str(path) + ": expected project flag 0/1 for " + entity_id)
+            flag = int(float(flag_text))
+            if row.get("exported_at", "").strip():
+                exported_at.add(row["exported_at"].strip())
+        records[entity_id] = {"name": row[name_column].strip(), "project": flag}
+    if not records:
+        raise ValueError(str(path) + ": no IDs found")
+    audit = file_audit(path, before, rows)
+    audit.update({"unique_ids": len(records), "blank_id_rows": 0, "repeated_id_rows": 0})
+    if not reference:
+        audit.update({
+            "confirmed_projects": sum(item["project"] for item in records.values()),
+            "not_confirmed_as_project": sum(item["project"] == 0 for item in records.values()),
+            "unnamed_ids": sum(not item["name"] for item in records.values()),
+            "exported_at_values": sorted(exported_at),
+        })
+    return records, audit
+
+
+def load_local(path):
+    before = fingerprint(path)
+    records = {}
+    rows = excluded = 0
+    for row in read_rows(path, ("id", "key", "title", "is_project")):
+        rows += 1
+        entity_id = row["id"].strip()
+        if not valid_id(entity_id):
+            excluded += 1
+            continue
+        item = records.setdefault(entity_id, {"names": set(), "project": 0, "own_rows": 0})
+        if row["key"].strip() == entity_id:
+            item["own_rows"] += 1
+            name = row["title"].strip()
+            if name:
+                item["names"].add(name)
+            if row["is_project"].strip().upper() == "Y":
+                item["project"] = 1
+    if not records:
+        raise ValueError(str(path) + ": no valid container IDs found")
+    for item in records.values():
+        # Equivalent to MAX(nonblank own-row title) under default text ordering.
+        item["name"] = max(item["names"], default="")
+    audit = file_audit(path, before, rows)
+    audit.update({
+        "unique_ids": len(records),
+        "excluded_blank_or_placeholder_id_rows": excluded,
+        "confirmed_projects": sum(item["project"] for item in records.values()),
+        "not_confirmed_as_project": sum(item["project"] == 0 for item in records.values()),
+        "unnamed_ids": sum(not item["name"] for item in records.values()),
+        "ids_without_own_row": sum(item["own_rows"] == 0 for item in records.values()),
+        "ids_with_multiple_own_names": sum(len(item["names"]) > 1 for item in records.values()),
+    })
+    return records, audit
+
+
+def compare(snowflake, local):
+    sf_ids, local_ids = set(snowflake), set(local)
+    shared = sf_ids & local_ids
+    return {
+        "snowflake_only": sf_ids - local_ids,
+        "local_only": local_ids - sf_ids,
+        "shared": shared,
+        "name_changes": {i for i in shared if snowflake[i]["name"] != local[i]["name"]},
+        "classification_changes": {i for i in shared if snowflake[i]["project"] != local[i]["project"]},
+    }
+
+
+def write_csv(path, headers, rows):
+    with path.open("x", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def write_results(output_dir, sf, local, ref, audits, comparison):
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + "_" + uuid.uuid4().hex[:6]
+    destination = output_dir / run_id
+    destination.mkdir(parents=True, exist_ok=False)
+    inventory_rows = (
+        [i, item["name"], item["project"], item["own_rows"], json.dumps(sorted(item["names"]), ensure_ascii=False)]
+        for i, item in sorted(local.items())
+    )
+    write_csv(destination / "local_project_container_inventory.csv", [
+        "project_id", "project_name", "is_confirmed_project", "own_row_count", "own_row_names_json"
+    ], inventory_rows)
+
+    def details(entity_id):
+        left, right = sf.get(entity_id, {}), local.get(entity_id, {})
+        return [entity_id, left.get("name", ""), right.get("name", ""),
+                left.get("project", ""), right.get("project", ""), int(entity_id in ref)]
+
+    common_headers = ["project_id", "snowflake_name", "local_name", "snowflake_is_confirmed_project",
+                      "local_is_confirmed_project", "in_akash_reference"]
+    difference_rows = []
+    for key, label in (("snowflake_only", "SNOWFLAKE_ONLY"), ("local_only", "LOCAL_ONLY")):
+        difference_rows.extend([label] + details(i) for i in sorted(comparison[key]))
+    write_csv(destination / "id_differences.csv", ["difference"] + common_headers, difference_rows)
+    changed = comparison["name_changes"] | comparison["classification_changes"]
+    write_csv(destination / "metadata_differences.csv", common_headers + ["name_changed", "classification_changed"], (
+        details(i) + [int(i in comparison["name_changes"]), int(i in comparison["classification_changes"])]
+        for i in sorted(changed)
+    ))
+    ids_match = not comparison["snowflake_only"] and not comparison["local_only"]
+    summary = {
+        "run_id": run_id,
+        "result": "IDS_MATCH" if ids_match else "IDS_DIFFER",
+        "inputs": audits,
+        "counts": {key: len(value) for key, value in comparison.items()},
+        "reference_ids_absent_from_snowflake": sorted(set(ref) - set(sf)),
+        "reference_ids_absent_from_local": sorted(set(ref) - set(local)),
+        "interpretation": (
+            "Comparison of supplied files only. ID equality does not establish identical full data, "
+            "API completeness, token identity or permissions. A missing ID is not proof of access loss. "
+            "Review extraction errors and snapshot times before using the Akash token. "
+            "The reference file labels membership only; it does not determine ID differences."
+        ),
+        "csv_note": "Text is preserved exactly after trimming. Import IDs/names as text when opening CSVs in Excel.",
+    }
+    with (destination / "summary.json").open("x", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return destination, ids_match
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--snowflake", type=Path, default=Path("snowflake_local_validation_baseline.csv"))
+    parser.add_argument("--reference", type=Path, default=Path("missing_wrike_projects_to_request.csv"))
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check-inputs", action="store_true", help="Check just the two saved inputs while extraction runs")
+    mode.add_argument("--local", type=Path, help="Exact path from the completed extraction's Saved message")
+    parser.add_argument("--output", type=Path, default=Path("output/baseline_validation"))
+    args = parser.parse_args()
+    sf, sf_audit = load_inventory(args.snowflake)
+    ref, ref_audit = load_inventory(args.reference, reference=True)
+    print("Snowflake: {:,} rows; {:,} unique IDs".format(sf_audit["data_rows"], len(sf)))
+    print("  Confirmed projects: {:,}".format(sf_audit["confirmed_projects"]))
+    print("  Not confirmed as projects: {:,}".format(sf_audit["not_confirmed_as_project"]))
+    print("  Unnamed IDs retained: {:,}".format(sf_audit["unnamed_ids"]))
+    print("Akash reference: {:,} rows; {:,} unique IDs".format(ref_audit["data_rows"], len(ref)))
+    print("Reference IDs absent from Snowflake: {:,}".format(len(set(ref) - set(sf))))
+    print("Both input inventories have no blank/PLACEHOLDER IDs or repeated IDs.")
+    if args.check_inputs:
+        print("Input checks complete. The running extraction was not read or compared.")
+        return 0
+
+    local, local_audit = load_local(args.local)
+    comparison = compare(sf, local)
+    destination, ids_match = write_results(args.output, sf, local, ref, {
+        "snowflake": sf_audit, "akash_reference": ref_audit, "local": local_audit
+    }, comparison)
+    print("\nLocal export: {:,} dataset rows; {:,} unique container IDs".format(local_audit["data_rows"], len(local)))
+    print("  Confirmed projects: {:,}".format(local_audit["confirmed_projects"]))
+    for key, label in (("shared", "IDs in both"), ("snowflake_only", "Snowflake only"),
+                       ("local_only", "Local only"), ("name_changes", "Shared IDs with different names"),
+                       ("classification_changes", "Shared IDs with different project flags")):
+        print("{}: {:,}".format(label, len(comparison[key])))
+    print("Local IDs with multiple own-row names: {:,}".format(local_audit["ids_with_multiple_own_names"]))
+    print("Result: " + ("ID SETS MATCH" if ids_match else "ID SETS DIFFER"))
+    print("Saved comparison: " + str(destination.resolve()))
+    print("This checks saved ID sets. Review extraction errors and snapshot times separately.")
+    return 0 if ids_match else 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, csv.Error) as exc:
+        print("ERROR: " + str(exc), file=sys.stderr)
+        sys.exit(1)
