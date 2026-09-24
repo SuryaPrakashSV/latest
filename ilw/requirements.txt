@@ -1,2 +1,24 @@
-cd ~/Desktop/wrike-local-baseline && \
-python3 validate_local_baseline.py --local "output/local_validation/20260924T213922_287354Z/wrike_local_full.csv"
+WITH container_check AS (
+    SELECT
+        TRIM("id") AS container_id,
+        COUNT(*) AS dataset_rows,
+        COUNT(CASE
+            WHEN TRIM("key") = TRIM("id") THEN 1
+        END) AS own_row_count,
+        MAX(CASE
+            WHEN TRIM("key") = TRIM("id")
+            THEN NULLIF(TRIM("title"), '')
+        END) AS own_row_name,
+        MAX(CASE
+            WHEN TRIM("key") = TRIM("id")
+            THEN UPPER(TRIM("is_project"))
+        END) AS own_row_project_flag
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE NULLIF(TRIM("id"), '') IS NOT NULL
+      AND UPPER(TRIM("id")) <> 'PLACEHOLDER'
+    GROUP BY TRIM("id")
+)
+SELECT *
+FROM container_check
+WHERE own_row_name IS NULL
+ORDER BY container_id;
