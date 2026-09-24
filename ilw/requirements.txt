@@ -1,6 +1,3 @@
-from getpass import getpass
+cd ~/Desktop/wrike-local-baseline && python3 -m py_compile Wrike_Data_local_validation.py
 
-TOKEN = getpass("Wrike token for local validation (hidden): ").strip()
-
-if not TOKEN:
-    raise RuntimeError("Wrike token cannot be empty.")
+python3 Wrike_Data_local_validation.py
