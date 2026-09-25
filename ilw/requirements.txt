@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+cd ~/Desktop/wrike-local-baseline && \
+python3 review_akash_comparison.py
+
 """Review saved Akash comparison inputs and logs. No API calls or token needed.
 
 Save beside validate_local_baseline.py in Desktop/wrike-local-baseline.
