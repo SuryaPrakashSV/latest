@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+cd ~/Desktop/wrike-local-baseline && python3 check_missing_wrike_ids.py
 """Check only the IDs absent from a saved Akash export, plus one control.
 
 Save beside validate_local_baseline.py and review_akash_comparison.py.
