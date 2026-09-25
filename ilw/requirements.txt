@@ -1,362 +1,329 @@
-cd ~/Desktop/wrike-local-baseline && python3 check_missing_wrike_ids.py
-"""Check only the IDs absent from a saved Akash export, plus one control.
+#!/usr/bin/env python3
+"""Confirm the base type of the four named Wrike items using Surya's token.
 
-Save beside validate_local_baseline.py and review_akash_comparison.py.
-python3 check_missing_wrike_ids.py --check-inputs  # offline checks only
-python3 check_missing_wrike_ids.py                 # prompts for Akash's token
-Use --comparison PATH if several saved Akash comparisons exist.
-No extraction script is executed. No Snowflake writes or inventory pulls occur.
+Save beside check_missing_wrike_ids.py, review_akash_comparison.py and
+validate_local_baseline.py in Desktop/wrike-local-baseline, then run:
+    python3 confirm_four_wrike_types.py
+
+Only the four exact IDs are checked. Optional filtered lookups are restricted
+to the returned permalink. No extraction code is executed and no data is changed
+in Wrike or Snowflake. The token is never written to the output files.
 """
-import argparse
-import ast
 import csv
 import getpass
 import hashlib
 import json
-import math
 import sys
 import time
 import warnings
+from collections import Counter
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
-import validate_local_baseline as baseline
+import check_missing_wrike_ids as shared
 import review_akash_comparison as review
+import validate_local_baseline as baseline
 
 
-MAX_ATTEMPTS = 4
-MAX_WAIT = 60.0
-RETRY_HTTP = {429, 500, 502, 503, 504}
-RESULT_COLUMNS = [
-    "project_id", "snowflake_name", "is_confirmed_project_in_snowflake",
-    "in_akash_reference", "reference_name", "previous_four_container",
-    "outcome", "reason", "http_status", "checked_at_utc", "attempts",
-    "api_title", "api_is_project", "api_account_id", "api_scope",
+BASE_URL = "https://www.wrike.com/api/v4"
+LOCAL_EXPORT = "output/local_validation/20260924T213922_287354Z/wrike_local_full.csv"
+DOCS = [
+    "https://developers.wrike.com/reference/getfoldersmulti",
+    "https://developers.wrike.com/reference/getfoldersempty",
 ]
-ATTEMPT_COLUMNS = ["time_utc", "role", "project_id", "attempt", "http_status", "reason", "retry_wait_seconds"]
+COLUMNS = [
+    "id", "expected_name", "api_title", "type", "reason", "scope",
+    "custom_item_type_id", "permalink", "project_field_present", "project_json",
+    "direct_http_status", "filter_http_status", "error_code", "checked_at_utc",
+    "local_dataset_rows", "local_own_rows", "local_is_project_values",
+]
+ATTEMPT_COLUMNS = ["time_utc", "id", "step", "attempt", "http_status", "reason", "wait_seconds"]
 
 
-def utc_now():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def check_id(value):
-    if not isinstance(value, str) or value != value.strip() or value.lower() in {"", "placeholder", "nan", "null", "none"}:
-        raise ValueError("Invalid ID in the intended lookup set; no API calls made.")
-
-
-def read_proxies(path):
-    """Read a literal assignment without importing or executing source code."""
-    before = baseline.fingerprint(path)
-    raw = path.read_bytes()
-    if baseline.fingerprint(path) != before:
-        raise ValueError("Validation source changed while reading.")
-    try:
-        tree = ast.parse(raw, filename=str(path))
-    except SyntaxError:
-        raise ValueError("Validation source has a syntax error; proxy settings were not read.") from None
-    assignments = []
-    for node in tree.body:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-        if any(isinstance(target, ast.Name) and target.id == "PROXIES" for target in targets):
-            if len(targets) != 1:
-                raise ValueError("Ambiguous PROXIES assignment in validation source.")
-            assignments.append(node.value)
-    if len(assignments) != 1:
-        raise ValueError("Expected exactly one top-level literal PROXIES assignment.")
-    try:
-        proxies = ast.literal_eval(assignments[0])
-    except (ValueError, TypeError, SyntaxError):
-        raise ValueError("PROXIES must be a literal dictionary or None.") from None
-    if proxies is not None and (not isinstance(proxies, dict) or any(
-        not isinstance(key, str) or (value is not None and not isinstance(value, str)) for key, value in proxies.items()
-    )):
-        raise ValueError("PROXIES must be a dictionary of strings/None or None.")
-    return proxies, {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest()}
-
-
-def prepare(root, folder):
-    summary_path = folder / "summary.json"
-    before = baseline.fingerprint(summary_path)
-    raw = summary_path.read_bytes()
-    if baseline.fingerprint(summary_path) != before:
-        raise ValueError("Comparison summary changed while reading.")
-    previous = json.loads(raw.decode("utf-8-sig"))
-    sources = previous["inputs"]
-    sf, sf_audit = baseline.load_inventory(Path(sources["snowflake"]["path"]))
-    ref, ref_audit = baseline.load_inventory(Path(sources["akash_reference"]["path"]), reference=True)
-    akash, akash_audit = baseline.load_local(Path(sources["local"]["path"]))
-    audits = {"snowflake": sf_audit, "akash_reference": ref_audit, "local": akash_audit}
-    if any(audits[name]["sha256"] != sources[name]["sha256"] for name in audits):
-        raise ValueError("An input differs from the saved comparison; no lookups started.")
-    differences = baseline.compare(sf, akash)
-    counts = {key: len(value) for key, value in differences.items()}
-    if counts != previous["counts"]:
-        raise ValueError("Recomputed comparison counts differ from the saved comparison.")
-    candidates = sorted(differences["snowflake_only"])
-    if not candidates:
-        raise ValueError("There are no Snowflake-only IDs to check.")
-    controls = sorted(entity_id for entity_id in differences["shared"]
-                      if akash[entity_id]["project"] == 1 and akash[entity_id]["own_rows"] > 0)
-    if not controls:
-        raise ValueError("No shared, previously returned project with an own row is available as a control.")
-    control = controls[0]
-    for entity_id in candidates + [control]:
-        check_id(entity_id)
-    proxies, source_audit = read_proxies(root / "Wrike_Data_local_validation.py")
-    return {
-        "sf": sf, "ref": ref, "candidates": candidates, "control": control, "proxies": proxies,
-        "audits": audits, "counts": counts, "source_audit": source_audit,
-        "comparison_path": str(folder.resolve()), "comparison_sha256": hashlib.sha256(raw).hexdigest(),
+def read_local_context(root):
+    path = root / LOCAL_EXPORT
+    rows = {
+        entity_id: {"dataset_rows": 0, "own_rows": 0, "raw_is_project_values": set(), "own_row_names": set()}
+        for entity_id in review.EXTRA_CONTAINERS
     }
+    if not path.is_file():
+        return {}, {"status": "UNAVAILABLE", "path": str(path), "reason": "Saved user export not found; direct check remains available."}
+    before, count = baseline.fingerprint(path), 0
+    try:
+        for row in baseline.read_rows(path, ("id", "key", "title", "is_project")):
+            count += 1
+            entity_id = row["id"].strip()
+            if entity_id not in rows:
+                continue
+            item = rows[entity_id]
+            item["dataset_rows"] += 1
+            if row["key"].strip() == entity_id:
+                item["own_rows"] += 1
+                item["raw_is_project_values"].add(row["is_project"])
+                item["own_row_names"].add(row["title"])
+        audit = baseline.file_audit(path, before, count)
+    except (OSError, ValueError, csv.Error):
+        return {}, {"status": "UNAVAILABLE", "path": str(path), "reason": "Saved user export could not be validated; direct check remains available."}
+    for item in rows.values():
+        item["raw_is_project_values"] = sorted(item["raw_is_project_values"])
+        item["own_row_names"] = sorted(item["own_row_names"])
+    audit.update({"status": "READ", "interpretation": "Transformed extraction flags are context, not independent proof of API item type."})
+    return rows, audit
 
 
-def retry_wait(header, default):
-    if header:
-        try:
-            seconds = float(header)
-            if math.isfinite(seconds):
-                return max(0.0, seconds)
-        except (ValueError, TypeError):
-            pass
-        try:
-            when = parsedate_to_datetime(header)
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
-        except (ValueError, TypeError, OverflowError):
-            pass
-    return default
-
-
-def response_result(response):
+def parse_response(response, entity_id, allow_empty=False):
+    """Accept only a bounded, unpaginated, exact-ID folder response."""
     try:
         body = response.json()
     except ValueError:
-        return "UNRESOLVED", "NON_JSON_RESPONSE", {}
+        return None, "NON_JSON_RESPONSE", ""
     if not isinstance(body, dict):
-        return "UNRESOLVED", "UNEXPECTED_JSON_SHAPE", {}
-    if response.status_code == 200:
-        data = body.get("data")
-        if body.get("kind") != "folders" or not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-            return "UNRESOLVED", "UNEXPECTED_FOLDER_RESPONSE", {}
-        return "RETRIEVED", "RETURNED_BY_DIRECT_LOOKUP", data[0]
-    if response.status_code in {403, 404}:
-        if not isinstance(body.get("error"), str) or not body["error"].strip():
-            return "UNRESOLVED", "NON_API_ERROR_RESPONSE", {}
-        return ("FORBIDDEN" if response.status_code == 403 else "NOT_FOUND"), "WRIKE_HTTP_" + str(response.status_code), {}
-    return "UNRESOLVED", "UNEXPECTED_HTTP_STATUS", {}
+        return None, "UNEXPECTED_JSON_SHAPE", ""
+    error = body.get("error", "")
+    error = error if isinstance(error, str) and len(error) <= 100 and all(c.isalnum() or c == "_" for c in error) else ""
+    if response.status_code != 200:
+        return None, "HTTP_" + str(response.status_code), error
+    if body.get("kind") != "folders" or not isinstance(body.get("data"), list):
+        return None, "UNEXPECTED_FOLDER_RESPONSE", error
+    if body.get("nextPageToken") or body.get("nextPage"):
+        return None, "UNEXPECTED_PAGINATION", error
+    data = body["data"]
+    if not data and allow_empty:
+        return None, "FILTER_RETURNED_NO_MATCH", error
+    if len(data) != 1 or not isinstance(data[0], dict) or data[0].get("id") != entity_id:
+        return None, "RETURNED_ID_MISMATCH_OR_COUNT", error
+    return data[0], "EXACT_ID_RETURNED", error
 
 
-class Probe:
+def valid_project_object(value):
+    return (isinstance(value, dict) and isinstance(value.get("ownerIds"), list)
+            and all(isinstance(owner, str) for owner in value["ownerIds"])
+            and isinstance(value.get("status"), str) and bool(value["status"].strip()))
+
+
+class Client:
     def __init__(self, session, token, proxies, emit, sleep=time.sleep, monotonic=time.monotonic):
         self.session, self.token, self.proxies, self.emit = session, token, proxies, emit
         self.sleep, self.monotonic, self.next_request = sleep, monotonic, 0.0
-        self.current_attempt = 0
 
-    def lookup(self, entity_id, role):
-        check_id(entity_id)
-        self.current_attempt = 0
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+    def request(self, entity_id, step, endpoint, params):
+        shared.check_id(entity_id)
+        for attempt in range(1, shared.MAX_ATTEMPTS + 1):
             wait = max(0.0, self.next_request - self.monotonic())
             if wait:
                 self.sleep(wait)
-            self.current_attempt = attempt
             self.next_request = self.monotonic() + 1.0
-            status, payload, stop = "", {}, False
+            status, error, item, stop = "", "", None, False
             try:
                 response = self.session.get(
-                    "https://www.wrike.com/api/v4/folders/" + quote(entity_id, safe=""),
+                    BASE_URL + endpoint, params=params,
                     headers={"Authorization": "Bearer " + self.token},
                     proxies=self.proxies, timeout=(15, 60), allow_redirects=False,
                 )
             except KeyboardInterrupt:
-                self.emit(role, entity_id, attempt, "", "INTERRUPTED", 0)
+                self.emit(entity_id, step, attempt, "", "INTERRUPTED", 0)
                 raise
             except requests.RequestException:
                 reason, retry, delay = "NETWORK_REQUEST_ERROR", True, float(2 ** (attempt - 1))
             else:
                 status = response.status_code
                 if status == 401:
-                    outcome, reason, retry, delay, stop = "UNRESOLVED", "AUTHENTICATION_FAILED", False, 0, True
-                elif status in RETRY_HTTP:
-                    retry = True
-                    reason = "RATE_LIMITED" if status == 429 else "RETRYABLE_SERVER_ERROR"
-                    delay = retry_wait(response.headers.get("Retry-After"), 5.0 if status == 429 else float(2 ** (attempt - 1)))
+                    reason, retry, delay, stop = "AUTHENTICATION_FAILED", False, 0, True
+                elif status in shared.RETRY_HTTP:
+                    reason, retry = "RATE_LIMITED" if status == 429 else "RETRYABLE_SERVER_ERROR", True
+                    delay = shared.retry_wait(response.headers.get("Retry-After"), 5.0 if status == 429 else float(2 ** (attempt - 1)))
                 else:
-                    outcome, reason, payload = response_result(response)
+                    item, reason, error = parse_response(response, entity_id, allow_empty=step != "direct")
                     retry, delay = False, 0
-                    if outcome == "RETRIEVED" and payload.get("id") != entity_id:
-                        outcome, reason, payload = "UNRESOLVED", "RETURNED_ID_MISMATCH", {}
             if retry:
-                if delay > MAX_WAIT:
-                    outcome, reason, stop, retry = "UNRESOLVED", "RETRY_AFTER_EXCEEDS_WAIT_LIMIT", True, False
-                elif attempt == MAX_ATTEMPTS:
-                    outcome, reason, stop, retry = "UNRESOLVED", reason + "_RETRIES_EXHAUSTED", True, False
-            self.emit(role, entity_id, attempt, status, reason, delay if retry else 0)
+                if delay > shared.MAX_WAIT:
+                    reason, stop, retry = "RETRY_AFTER_EXCEEDS_WAIT_LIMIT", True, False
+                elif attempt == shared.MAX_ATTEMPTS:
+                    reason, stop, retry = reason + "_RETRIES_EXHAUSTED", True, False
+            self.emit(entity_id, step, attempt, status, reason, delay if retry else 0)
             if retry:
-                print("Retry {}/{} for {} after {:.1f}s ({})".format(attempt, MAX_ATTEMPTS, entity_id, delay, reason), flush=True)
                 self.next_request = max(self.next_request, self.monotonic() + delay)
                 continue
-            return {
-                "outcome": outcome, "reason": reason, "http_status": status,
-                "checked_at_utc": utc_now(), "attempts": attempt,
-                "api_title": payload.get("title", ""),
-                "api_is_project": int(isinstance(payload.get("project"), dict)) if payload else "",
-                "api_account_id": payload.get("accountId", ""), "api_scope": payload.get("scope", ""),
-            }, stop
-        raise RuntimeError("Lookup ended without a recorded outcome.")
+            return {"http_status": status, "reason": reason, "error_code": error, "item": item}, stop
+        raise RuntimeError("Request ended without a recorded result.")
 
 
-def candidate_row(context, entity_id, result=None):
-    item, ref = context["sf"][entity_id], context["ref"].get(entity_id, {})
-    row = {
-        "project_id": entity_id, "snowflake_name": item["name"],
-        "is_confirmed_project_in_snowflake": item["project"],
-        "in_akash_reference": int(entity_id in context["ref"]), "reference_name": ref.get("name", ""),
-        "previous_four_container": int(entity_id in review.EXTRA_CONTAINERS),
-        "outcome": "NOT_CHECKED", "reason": "NOT_ATTEMPTED", "http_status": "",
-        "checked_at_utc": "", "attempts": 0,
+def minimized(item):
+    if not item:
+        return None
+    return {key: item[key] for key in ("id", "title", "scope", "permalink", "customItemTypeId", "project") if key in item}
+
+
+def classify(client, entity_id, expected_name, local=None):
+    local = local or {}
+    result = {
+        "id": entity_id, "expected_name": expected_name, "api_title": "", "type": "UNRESOLVED",
+        "reason": "", "scope": "", "custom_item_type_id": "", "permalink": "",
+        "project_field_present": "", "project_json": "", "direct_http_status": "",
+        "filter_http_status": "", "error_code": "", "checked_at_utc": now(),
+        "local_dataset_rows": local.get("dataset_rows", ""), "local_own_rows": local.get("own_rows", ""),
+        "local_is_project_values": json.dumps(local.get("raw_is_project_values", []), ensure_ascii=False),
     }
-    row.update(result or {})
-    return row
-
-
-def write_summary(path, data):
-    temporary = path.with_suffix(".json.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
-    temporary.replace(path)
-
-
-def execute(context, folder, token, session=None):
-    destination = folder / ("targeted_check_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
-    destination.mkdir(exist_ok=False)
-    summary = {
-        "status": "RUNNING", "started_at_utc": utc_now(),
-        "comparison_folder": context["comparison_path"], "comparison_summary_sha256": context["comparison_sha256"],
-        "verified_inputs": context["audits"], "comparison_counts": context["counts"],
-        "helper_source": {"path": str(Path(__file__).resolve()), "sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
-        "proxy_source": context["source_audit"], "expected_candidate_count": len(context["candidates"]),
-        "control_id": context["control"], "control_result": None, "token_label": "Akash, supplied by operator; identity not independently verified",
-        "interpretation": "Direct lookup observations at the recorded times. HTTP 403/404 do not prove deletion or permission loss. Unresolved/not checked IDs are not access failures. This does not verify task completeness.",
-    }
-    write_summary(destination / "summary.json", summary)
-    results, current, control_phase, reason = [], None, True, ""
-    owned_session = session is None
-    session = requests.Session() if session is None else session  # Keep environment and TLS defaults.
-    try:
-        with (destination / "attempts.csv").open("x", encoding="utf-8-sig", newline="") as attempt_file, \
-             (destination / "lookup_results.csv").open("x", encoding="utf-8-sig", newline="") as result_file:
-            attempt_writer = csv.DictWriter(attempt_file, fieldnames=ATTEMPT_COLUMNS)
-            result_writer = csv.DictWriter(result_file, fieldnames=RESULT_COLUMNS)
-            attempt_writer.writeheader()
-            result_writer.writeheader()
-            attempt_file.flush()
-            result_file.flush()
-
-            def emit(role, entity_id, attempt, status, explanation, delay):
-                attempt_writer.writerow(dict(zip(ATTEMPT_COLUMNS, [utc_now(), role, entity_id, attempt, status, explanation, delay])))
-                attempt_file.flush()
-
-            def record(row):
-                result_writer.writerow(row)
-                result_file.flush()
-                results.append(row)
-
-            probe = Probe(session, token, context["proxies"], emit)
-            try:
-                control, _ = probe.lookup(context["control"], "CONTROL")
-                summary["control_result"] = control
-                write_summary(destination / "summary.json", summary)
-                if control["outcome"] != "RETRIEVED":
-                    reason = "CONTROL_NOT_RETRIEVED"
-                else:
-                    control_phase = False
-                    print("Control returned correctly. Checking {} candidate IDs.".format(len(context["candidates"])), flush=True)
-                    for current in context["candidates"]:
-                        probe.current_attempt = 0
-                        result, stop = probe.lookup(current, "CANDIDATE")
-                        record(candidate_row(context, current, result))
-                        print("{}/{}: {} {}".format(len(results), len(context["candidates"]), current, result["outcome"]), flush=True)
-                        if stop:
-                            reason = result["reason"]
-                            break
-            except KeyboardInterrupt:
-                reason = "INTERRUPTED"
-                interrupted = {"outcome": "UNRESOLVED" if probe.current_attempt else "NOT_CHECKED", "reason": reason,
-                               "checked_at_utc": utc_now() if probe.current_attempt else "", "attempts": probe.current_attempt}
-                if control_phase:
-                    summary["control_result"] = interrupted
-                elif current and current not in {row["project_id"] for row in results}:
-                    record(candidate_row(context, current, interrupted))
-            except Exception as error:
-                reason = "LOCAL_CHECK_ERROR_" + type(error).__name__
-                if not control_phase and current and current not in {row["project_id"] for row in results}:
-                    record(candidate_row(context, current, {"outcome": "UNRESOLVED", "reason": reason, "checked_at_utc": utc_now(), "attempts": probe.current_attempt}))
-            finally:
-                completed = {row["project_id"] for row in results}
-                for entity_id in context["candidates"]:
-                    if entity_id not in completed:
-                        record(candidate_row(context, entity_id, {"reason": reason or "NOT_ATTEMPTED"}))
-    finally:
-        if owned_session:
-            session.close()
-
-    for name, outcomes in {
-        "not_retrievable_this_check.csv": {"NOT_FOUND", "FORBIDDEN"},
-        "retrieved_by_direct_lookup.csv": {"RETRIEVED"},
-        "unresolved.csv": {"UNRESOLVED", "NOT_CHECKED"},
-    }.items():
-        review.save_csv(destination / name, RESULT_COLUMNS, [row for row in results if row["outcome"] in outcomes])
-    summary.update({
-        "finished_at_utc": utc_now(), "stop_reason": reason,
-        "status": "STOPPED" if reason else "COMPLETED_WITH_UNRESOLVED" if any(row["outcome"] == "UNRESOLVED" for row in results) else "COMPLETED",
-        "candidate_outcome_counts": {outcome: sum(row["outcome"] == outcome for row in results) for outcome in ["RETRIEVED", "NOT_FOUND", "FORBIDDEN", "UNRESOLVED", "NOT_CHECKED"]},
-        "candidate_results_count": len(results),
-        "reference_outcomes": {outcome: sum(row["outcome"] == outcome and row["in_akash_reference"] for row in results) for outcome in ["RETRIEVED", "NOT_FOUND", "FORBIDDEN", "UNRESOLVED", "NOT_CHECKED"]},
-        "previous_four_containers": [row for row in results if row["previous_four_container"]],
+    evidence = {"id": entity_id, "direct": None, "filtered": None, "filter_project": None}
+    direct, stop = client.request(entity_id, "direct", "/folders/" + quote(entity_id, safe=""), {"fields": '["customItemTypeId"]'})
+    item = direct["item"]
+    result.update({"direct_http_status": direct["http_status"], "reason": direct["reason"], "error_code": direct["error_code"]})
+    evidence["direct"] = {**direct, "item": minimized(item)}
+    if item is None:
+        return result, evidence, stop
+    project, scope = item.get("project"), item.get("scope", "")
+    result.update({
+        "api_title": item.get("title", ""), "scope": scope,
+        "custom_item_type_id": item.get("customItemTypeId", ""), "permalink": item.get("permalink", ""),
+        "project_field_present": int("project" in item),
+        "project_json": json.dumps(project, ensure_ascii=False) if "project" in item else "",
     })
-    write_summary(destination / "summary.json", summary)
-    print("Lookup outcomes: " + json.dumps(summary["candidate_outcome_counts"]), flush=True)
-    print("Saved targeted check: " + str(destination.resolve()), flush=True)
-    print("These are lookup results, not proof of permission loss or task completeness.")
-    return summary, destination
+    if not isinstance(scope, str):
+        result["reason"] = "MALFORMED_SCOPE"
+        return result, evidence, False
+    if project is not None and not isinstance(project, dict):
+        result["reason"] = "MALFORMED_PROJECT_FIELD"
+        return result, evidence, False
+    if valid_project_object(project):
+        result.update({"type": "PROJECT", "reason": "PROJECT_OBJECT_RETURNED"})
+        return result, evidence, False
+    permalink = item.get("permalink")
+    if not isinstance(permalink, str) or not permalink.strip():
+        result["reason"] = "PERMALINK_REQUIRED_TO_CONFIRM_BASE_TYPE"
+        return result, evidence, False
+    expected_project = isinstance(project, dict)
+    params = {"permalink": permalink, "project": "true" if expected_project else "false", "pageSize": 2,
+              "fields": '["customItemTypeId"]'}
+    if scope == "RbFolder":
+        params["deleted"] = "true"
+    evidence["filter_project"] = expected_project
+    filtered, stop = client.request(entity_id, "project_filter" if expected_project else "folder_filter", "/folders", params)
+    match = filtered["item"]
+    evidence["filtered"] = {**filtered, "item": minimized(match)}
+    result.update({"filter_http_status": filtered["http_status"], "reason": filtered["reason"], "error_code": filtered["error_code"]})
+    if match is None:
+        return result, evidence, stop
+    if match.get("permalink") != permalink:
+        result["reason"] = "FILTER_PERMALINK_MISMATCH"
+        return result, evidence, False
+    if match.get("scope", scope) != scope:
+        result["reason"] = "SCOPE_CHANGED_DURING_CHECK"
+        return result, evidence, False
+    match_project = match.get("project")
+    if expected_project:
+        if "project" in match and not isinstance(match_project, dict):
+            result["reason"] = "PROJECT_TRUE_FILTER_CONFLICT"
+        else:
+            result.update({"type": "PROJECT", "reason": "MATCHED_EXACT_PERMALINK_PROJECT_TRUE_FILTER"})
+    elif match_project is not None:
+        result["reason"] = "PROJECT_FALSE_FILTER_CONFLICT"
+    else:
+        result.update({"type": "FOLDER" if scope == "WsFolder" else "NON_PROJECT_CONTAINER",
+                       "reason": "MATCHED_EXACT_PERMALINK_PROJECT_FALSE_FILTER"})
+    return result, evidence, stop
+
+
+def write_outputs(destination, report):
+    shared.write_summary(destination / "type_evidence.json", report)
+    temporary = destination / "four_item_types.csv.tmp"
+    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(report["results"])
+    temporary.replace(destination / "four_item_types.csv")
+
+
+def run(root, token, proxies, source_audit, local, local_audit, session=None):
+    destination = root / "output" / "four_item_types" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    destination.mkdir(parents=True, exist_ok=False)
+    report = {
+        "started_at_utc": now(), "status": "RUNNING", "token_label": "Surya/production token supplied by operator; identity not independently verified",
+        "proxy_source": source_audit, "local_export": local_audit, "local_context": local,
+        "helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "documentation": DOCS, "results": [], "evidence": [],
+        "interpretation": "Base type as returned at check time. Custom item type IDs and scopes are retained. A failed lookup leaves type unresolved. This does not verify permissions, historical type or task completeness.",
+    }
+    write_outputs(destination, report)
+    own_session = session is None
+    session = requests.Session() if session is None else session
+    completed, stopped, active_id = set(), False, None
+    try:
+        with (destination / "attempts.csv").open("x", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=ATTEMPT_COLUMNS)
+            writer.writeheader()
+            handle.flush()
+            def emit(entity_id, step, attempt, status, reason, delay):
+                writer.writerow(dict(zip(ATTEMPT_COLUMNS, (now(), entity_id, step, attempt, status, reason, delay))))
+                handle.flush()
+            client = Client(session, token, proxies, emit)
+            for entity_id, expected_name in review.EXTRA_CONTAINERS.items():
+                active_id = entity_id
+                result, evidence, stop = classify(client, entity_id, expected_name, local.get(entity_id))
+                report["results"].append(result)
+                report["evidence"].append(evidence)
+                completed.add(entity_id)
+                write_outputs(destination, report)
+                print("{}: {} ({})".format(expected_name, result["type"], result["reason"]), flush=True)
+                if stop:
+                    stopped = True
+                    report["stop_reason"] = result["reason"]
+                    break
+    except KeyboardInterrupt:
+        stopped = True
+        report["stop_reason"] = "INTERRUPTED"
+    except Exception as exc:
+        stopped = True
+        report["stop_reason"] = "LOCAL_ERROR_" + type(exc).__name__
+    finally:
+        if own_session:
+            session.close()
+        if active_id is not None and active_id not in completed:
+            report["results"].append({
+                "id": active_id, "expected_name": review.EXTRA_CONTAINERS[active_id],
+                "type": "UNRESOLVED", "reason": report.get("stop_reason", "INTERRUPTED_BEFORE_RESULT"),
+                "checked_at_utc": now(),
+            })
+            completed.add(active_id)
+        for entity_id, expected_name in review.EXTRA_CONTAINERS.items():
+            if entity_id not in completed:
+                report["results"].append({"id": entity_id, "expected_name": expected_name, "type": "NOT_CHECKED", "reason": "CHECK_STOPPED_BEFORE_RESULT"})
+        report.update({"status": "STOPPED" if stopped else "FINISHED", "finished_at_utc": now(),
+                       "counts": dict(Counter(row["type"] for row in report["results"]))})
+        write_outputs(destination, report)
+    print("Type counts: " + json.dumps(report["counts"], sort_keys=True), flush=True)
+    print("Saved: " + str(destination), flush=True)
+    return 0 if all(row["type"] in {"PROJECT", "FOLDER", "NON_PROJECT_CONTAINER"} for row in report["results"]) else 2
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--comparison", type=Path)
-    parser.add_argument("--check-inputs", action="store_true", help="Validate saved inputs, control and proxy settings without network or output files")
-    args = parser.parse_args()
     root = Path(__file__).resolve().parent
-    folder = review.select_comparison(root, args.comparison)
-    context = prepare(root, folder)
-    print("Input hashes and comparison counts verified.")
-    print("Candidate IDs: {}; known-returned control: {}".format(len(context["candidates"]), context["control"]))
-    print("Proxy settings read without executing the extraction script.")
-    if args.check_inputs:
-        print("Offline checks complete. No API calls or output files created.")
-        return 0
+    for entity_id in review.EXTRA_CONTAINERS:
+        shared.check_id(entity_id)
+    proxies, source_audit = shared.read_proxies(root / "Wrike_Data_local_validation.py")
+    local, audit = read_local_context(root)
+    if local:
+        for entity_id, item in local.items():
+            print("Saved export - {}: own rows {}; is_project values {}".format(review.EXTRA_CONTAINERS[entity_id], item["own_rows"], repr(item["raw_is_project_values"])))
+    else:
+        print(audit["reason"])
+    print("Checking only four IDs. Enter YOUR production Wrike token, not Akash's.", flush=True)
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
-        try:
-            token = getpass.getpass("Akash Wrike token (hidden): ").strip()
-        except getpass.GetPassWarning:
-            raise ValueError("Hidden token input is unavailable. Run this command in an interactive Terminal.") from None
-    if not token:
-        raise ValueError("No token supplied; no lookups started.")
-    summary, _ = execute(context, folder, token)
-    return 0 if summary["status"] == "COMPLETED" else 2
+        token = getpass.getpass("Your Wrike token (hidden): ").strip()
+    if not token or any(char.isspace() for char in token):
+        raise ValueError("Token is empty or contains whitespace; no calls made.")
+    return run(root, token, proxies, source_audit, local, audit)
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
-        print("Check error: " + str(error), file=sys.stderr)
+    except (OSError, ValueError, csv.Error, getpass.GetPassWarning) as exc:
+        print("Could not complete type check ({}). Check that this file and its helper files are saved beside Wrike_Data_local_validation.py and use an interactive terminal.".format(type(exc).__name__), file=sys.stderr)
         sys.exit(1)
