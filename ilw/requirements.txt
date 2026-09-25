@@ -1,3 +1,4 @@
 cd ~/Desktop/wrike-local-baseline && \
-python3 -u Wrike_Data_local_validation.py 2>&1 | \
-tee "output/akash_run_$(date +%Y%m%d_%H%M%S).log"
+python3 validate_local_baseline.py \
+  --local "output/local_validation/20260925T001910_967424Z/wrike_local_full.csv" \
+  --output "output/akash_comparison"
